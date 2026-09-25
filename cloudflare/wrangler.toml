@@ -1,0 +1,9 @@
+name = "udp-matchmaker"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# KV Namespace binding for persistent state across global edge nodes
+# Run `npx wrangler kv namespace create ROOMS` and paste the id below:
+# [[kv_namespaces]]
+# binding = "ROOMS"
+# id = "c7694ad8f2254b4c97aa412ddc290c67"
