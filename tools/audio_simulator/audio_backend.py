@@ -92,6 +92,14 @@ class AudioBackend:
         """Stop audio streams or generators and clean up resources."""
         raise NotImplementedError
 
+    def flush_input(self):
+        """Flushes any buffered input frames before transmission starts."""
+        pass
+
+    def has_buffered_input(self) -> bool:
+        """Returns True if there are unread input frames in the capture queue."""
+        return False
+
     def read_frame(self) -> bytes:
         """
         Reads one 20ms audio frame (640 bytes, 16 kHz 16-bit signed mono PCM).
@@ -126,6 +134,9 @@ class SyntheticAudioBackend(AudioBackend):
 
         # Tone modes: 'tone', 'silence', 'roger_beep'
         self.tone_mode = "tone"
+
+    def flush_input(self):
+        self._sample_index = 0
 
     def start(self):
         self._running = True
@@ -217,17 +228,30 @@ class SyntheticAudioBackend(AudioBackend):
 class SounddeviceBackend(AudioBackend):
     """
     Live hardware audio backend using the sounddevice library.
-    Captures live microphone input and streams output to speakers.
+    Captures live microphone input and streams output to speakers with ultra-low latency.
     """
 
     def __init__(self, record_path: str = None):
         self.record_path = record_path
         self._running = False
         self._stream = None
-        self._in_queue = queue.Queue(maxsize=50)
-        self._out_queue = queue.Queue(maxsize=50)
+        # Keep queue depths minimal (under 60-80ms) to eliminate delay and latency buildup
+        self._in_queue = queue.Queue(maxsize=3)
+        self._out_queue = queue.Queue(maxsize=3)
         self._wav_out = None
         self._out_lock = threading.Lock()
+
+    def has_buffered_input(self) -> bool:
+        """Returns True if there are captured mic frames awaiting transmission."""
+        return not self._in_queue.empty()
+
+    def flush_input(self):
+        """Discards any stale audio buffered prior to PTT keying so speech starts instantly."""
+        while not self._in_queue.empty():
+            try:
+                self._in_queue.get_nowait()
+            except Exception:
+                break
 
     def start(self):
         import sounddevice as sd
@@ -245,7 +269,7 @@ class SounddeviceBackend(AudioBackend):
                 self._wav_out = None
 
         def audio_callback(indata, outdata, frames, time_info, status):
-            # Input capture
+            # Input capture: always keep the freshest frames in queue
             raw_in = bytes(indata)
             try:
                 self._in_queue.put_nowait(raw_in)
@@ -256,18 +280,20 @@ class SounddeviceBackend(AudioBackend):
                 except Exception:
                     pass
 
-            # Output playback
+            # Output playback: pull frame or output silence
             try:
                 raw_out = self._out_queue.get_nowait()
                 outdata[:] = raw_out
             except queue.Empty:
                 outdata.fill(0)
 
+        # Use latency='low' to trigger low-latency audio driver paths (WASAPI / CoreAudio / ALSA)
         self._stream = sd.RawStream(
             samplerate=SAMPLE_RATE,
             blocksize=SAMPLES_PER_FRAME,
             channels=CHANNELS,
             dtype="int16",
+            latency="low",
             callback=audio_callback,
         )
         self._stream.start()
@@ -295,7 +321,7 @@ class SounddeviceBackend(AudioBackend):
             return b"\x00" * BYTES_PER_FRAME
 
         try:
-            return self._in_queue.get(timeout=0.05)
+            return self._in_queue.get(timeout=0.03)
         except queue.Empty:
             return b"\x00" * BYTES_PER_FRAME
 
@@ -309,14 +335,17 @@ class SounddeviceBackend(AudioBackend):
         elif len(pcm_data) > BYTES_PER_FRAME:
             pcm_data = pcm_data[:BYTES_PER_FRAME]
 
+        # Prevent queue latency buildup: if 2 frames are already waiting, drop oldest
+        while self._out_queue.qsize() >= 2:
+            try:
+                self._out_queue.get_nowait()
+            except Exception:
+                break
+
         try:
             self._out_queue.put_nowait(pcm_data)
         except queue.Full:
-            try:
-                self._out_queue.get_nowait()
-                self._out_queue.put_nowait(pcm_data)
-            except Exception:
-                pass
+            pass
 
         with self._out_lock:
             if self._wav_out:

@@ -105,6 +105,28 @@ class TerminalController:
             return None
 
 
+class WindowsTimerResolution:
+    """Ensures 1ms timer resolution on Windows for precise 50 Hz audio streaming."""
+
+    def __enter__(self):
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                self._winmm = ctypes.windll.winmm
+                self._winmm.timeBeginPeriod(1)
+            except Exception:
+                self._winmm = None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if os.name == "nt" and getattr(self, "_winmm", None):
+            try:
+                self._winmm.timeEndPeriod(1)
+            except Exception:
+                pass
+
+
 class RoipAudioSimulator:
     """
     Desktop Audio Simulator managing the 50 Hz audio transmission loop,
@@ -133,7 +155,7 @@ class RoipAudioSimulator:
         if hasattr(self.audio_backend, "tone_freq"):
             self.audio_backend.tone_freq = tone_freq
 
-        self.jitter_buffer = JitterBuffer(target_delay_frames=2, max_frames=20)
+        self.jitter_buffer = JitterBuffer(target_delay_frames=1, max_frames=4)
         self.auto_ptt_interval = auto_ptt_interval
         self.busy_channel_lockout = busy_channel_lockout
         self.roger_beep = roger_beep
@@ -220,6 +242,7 @@ class RoipAudioSimulator:
         frame_interval_s = FRAME_DURATION_MS / 1000.0  # 0.020 s
         next_deadline = time.time()
         last_heartbeat_time = 0.0
+        was_transmitting = False
 
         while self.running and self.udp_manager.connected:
             now = time.time()
@@ -232,21 +255,35 @@ class RoipAudioSimulator:
                 # Simplex radio rule: transmitting RF squelches local receiver (COS=False)
                 self.roip.send_data(payload=pcm_data, ptt=True, cos=False)
                 self.tx_audio_frames += 1
+                was_transmitting = True
+
+            elif was_transmitting and self.audio_backend.has_buffered_input():
+                # Drain trailing audio frames captured right before unkeying
+                pcm_data = self.audio_backend.read_frame()
+                self.last_tx_db = calculate_rms_db(pcm_data)
+                self.roip.send_data(payload=pcm_data, ptt=True, cos=False)
+                self.tx_audio_frames += 1
 
             else:
-                # Idle: send 8-byte heartbeat at ~1 Hz keepalive
-                cos_state = self.jitter_buffer.is_receiving
-                if now - last_heartbeat_time >= 1.0:
-                    self.roip.send_heartbeat(ptt=False, cos=cos_state)
+                if was_transmitting:
+                    # Trailing speech frames fully drained: send clean unkey heartbeat
+                    self.roip.send_heartbeat(ptt=False, cos=self.jitter_buffer.is_receiving)
                     self.tx_heartbeats += 1
                     last_heartbeat_time = now
+                    was_transmitting = False
+                elif now - last_heartbeat_time >= 1.0:
+                    # Idle: send 8-byte heartbeat at ~1 Hz keepalive
+                    self.roip.send_heartbeat(ptt=False, cos=self.jitter_buffer.is_receiving)
+                    self.tx_heartbeats += 1
+                    last_heartbeat_time = now
+
                 self.last_tx_db = -96.0
 
             next_deadline += frame_interval_s
             sleep_time = next_deadline - time.time()
             if sleep_time > 0:
                 time.sleep(sleep_time)
-            else:
+            elif sleep_time < -frame_interval_s:
                 # Running behind; catch up deadline
                 next_deadline = time.time()
 
@@ -282,7 +319,7 @@ class RoipAudioSimulator:
             sleep_time = next_deadline - time.time()
             if sleep_time > 0:
                 time.sleep(sleep_time)
-            else:
+            elif sleep_time < -frame_interval_s:
                 next_deadline = time.time()
 
     def trigger_tone_burst(self, duration_s: float = 1.0) -> bool:
@@ -305,16 +342,14 @@ class RoipAudioSimulator:
 
         if not self.ptt_active:
             self.ptt_active = True
-            # In simplex: transmitting RF disables our receiver (COS=False)
-            self.roip.send_heartbeat(ptt=True, cos=False)
+            # Flush mic input queue so stale ambient audio buffered while idle is discarded
+            self.audio_backend.flush_input()
         return True
 
     def unkey_ptt(self):
         """Deactivates PTT (Push-to-Talk released)."""
         if self.ptt_active:
             self.ptt_active = False
-            # Send an immediate heartbeat with PTT=False
-            self.roip.send_heartbeat(ptt=False, cos=self.jitter_buffer.is_receiving)
 
     def toggle_ptt(self) -> bool:
         """Toggles PTT state."""
@@ -389,7 +424,7 @@ def main():
     parser.add_argument("--wav-play", type=str, default=None, help="Path to 16kHz mono WAV file to transmit on PTT")
     parser.add_argument("--wav-record", type=str, default=None, help="Path to record received PCM audio as WAV")
     parser.add_argument("--auto-ptt", type=float, default=0.0, help="Automated PTT toggle interval in seconds (0 = disabled)")
-    parser.add_argument("--ptt-hold-timeout", type=float, default=0.5, help="Hold timeout in seconds for terminal Push-to-Talk (default: 0.5s)")
+    parser.add_argument("--ptt-hold-timeout", type=float, default=0.35, help="Hold timeout in seconds for terminal Push-to-Talk (default: 0.35s)")
     parser.add_argument("--allow-doubling", action="store_true", help="Disable Busy Channel Lockout (allow simultaneous transmitting)")
     parser.add_argument("--no-roger-beep", action="store_true", help="Disable courtesy tone / roger beep on remote unkey")
     args = parser.parse_args()
@@ -476,69 +511,70 @@ def main():
         busy_channel_lockout=not args.allow_doubling,
         roger_beep=not args.no_roger_beep,
     )
-    sim.start()
+    with WindowsTimerResolution():
+        sim.start()
 
-    # Automated PTT thread if requested
-    if args.auto_ptt > 0:
-        def auto_ptt_worker():
-            while sim.running:
-                time.sleep(args.auto_ptt)
-                sim.toggle_ptt()
+        # Automated PTT thread if requested
+        if args.auto_ptt > 0:
+            def auto_ptt_worker():
+                while sim.running:
+                    time.sleep(args.auto_ptt)
+                    sim.toggle_ptt()
 
-        threading.Thread(target=auto_ptt_worker, daemon=True, name="AutoPTT").start()
+            threading.Thread(target=auto_ptt_worker, daemon=True, name="AutoPTT").start()
 
-    if os.name == "nt":
-        # Enable ANSI escape sequences on Windows console/PowerShell
+        if os.name == "nt":
+            # Enable ANSI escape sequences on Windows console/PowerShell
+            try:
+                os.system("")
+            except Exception:
+                pass
+
+        # 4. Interactive Loop (Push-to-Talk: Hold SPACE/P to talk, release to unkey)
+        PTT_HOLD_TIMEOUT = args.ptt_hold_timeout
+        last_ptt_press_time = 0.0
+
         try:
-            os.system("")
-        except Exception:
+            with TerminalController() as term:
+                # Immediate initial dashboard display
+                if term.interactive:
+                    print_dashboard(sim)
+
+                last_dashboard_update = time.time()
+                while sim.running and udp_mgr.connected:
+                    now = time.time()
+
+                    # Push-to-Talk: Automatically unkey when key release timeout is reached
+                    if sim.ptt_active and (now - last_ptt_press_time > PTT_HOLD_TIMEOUT):
+                        sim.unkey_ptt()
+
+                    # Update dashboard ~5 times/second
+                    if now - last_dashboard_update >= 0.2:
+                        if term.interactive:
+                            print_dashboard(sim)
+                        last_dashboard_update = now
+
+                    key = term.get_key(timeout=0.03)
+                    if not key:
+                        continue
+
+                    key_lower = key.lower()
+                    if key_lower in ("q", "\x03"):  # 'q' or Ctrl-C
+                        break
+                    elif key_lower in (" ", "p"):
+                        last_ptt_press_time = time.time()
+                        sim.key_ptt()
+                    elif key_lower == "t":
+                        sim.trigger_tone_burst(duration_s=1.0)
+                    elif key_lower == "h":
+                        sim.roip.send_heartbeat(ptt=sim.ptt_active, cos=sim.jitter_buffer.is_receiving)
+
+        except (KeyboardInterrupt, EOFError):
             pass
-
-    # 4. Interactive Loop (Push-to-Talk: Hold SPACE/P to talk, release to unkey)
-    PTT_HOLD_TIMEOUT = args.ptt_hold_timeout
-    last_ptt_press_time = 0.0
-
-    try:
-        with TerminalController() as term:
-            # Immediate initial dashboard display
-            if term.interactive:
-                print_dashboard(sim)
-
-            last_dashboard_update = time.time()
-            while sim.running and udp_mgr.connected:
-                now = time.time()
-
-                # Push-to-Talk: Automatically unkey when key release timeout is reached
-                if sim.ptt_active and (now - last_ptt_press_time > PTT_HOLD_TIMEOUT):
-                    sim.unkey_ptt()
-
-                # Update dashboard ~5 times/second
-                if now - last_dashboard_update >= 0.2:
-                    if term.interactive:
-                        print_dashboard(sim)
-                    last_dashboard_update = now
-
-                key = term.get_key(timeout=0.03)
-                if not key:
-                    continue
-
-                key_lower = key.lower()
-                if key_lower in ("q", "\x03"):  # 'q' or Ctrl-C
-                    break
-                elif key_lower in (" ", "p"):
-                    last_ptt_press_time = time.time()
-                    sim.key_ptt()
-                elif key_lower == "t":
-                    sim.trigger_tone_burst(duration_s=1.0)
-                elif key_lower == "h":
-                    sim.roip.send_heartbeat(ptt=sim.ptt_active, cos=sim.jitter_buffer.is_receiving)
-
-    except (KeyboardInterrupt, EOFError):
-        pass
-    finally:
-        print("\n[*] Stopping Audio Simulator...")
-        sim.stop()
-        print("[*] Audio Simulator stopped.")
+        finally:
+            print("\n[*] Stopping Audio Simulator...")
+            sim.stop()
+            print("[*] Audio Simulator stopped.")
 
 
 if __name__ == "__main__":

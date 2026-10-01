@@ -15,9 +15,9 @@ class JitterBuffer:
     Also tracks carrier-operated squelch (COS) activity based on packet arrival timing.
     """
 
-    def __init__(self, target_delay_frames: int = 2, max_frames: int = 15, squelch_timeout_s: float = 0.15):
+    def __init__(self, target_delay_frames: int = 1, max_frames: int = 4, squelch_timeout_s: float = 0.15):
         """
-        target_delay_frames: Number of frames to accumulate before initiating playback (e.g. 2 frames = 40ms).
+        target_delay_frames: Number of frames to accumulate before initiating playback (e.g. 1 frame = 20ms).
         max_frames: Maximum allowable frames in buffer before dropping oldest (prevents runaway latency).
         squelch_timeout_s: Duration without packets before COS is considered inactive.
         """
