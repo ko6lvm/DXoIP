@@ -1,0 +1,8 @@
+# Optional dependencies for live hardware microphone and speaker audio streaming
+# (The simulator includes a built-in synthetic 16kHz PCM audio engine and WAV
+# recorder that requires ZERO external dependencies)
+
+# To use live microphone / speaker streaming:
+# On Debian/Ubuntu: sudo apt-get install libportaudio2
+# On macOS: brew install portaudio
+sounddevice>=0.4.6

@@ -1,0 +1,292 @@
+"""
+Unit and Integration Tests for RoIP Audio Simulator (tests/test_audio_simulator.py)
+Tests:
+1. Synthetic audio generation (16 kHz, 16-bit signed PCM mono, 640 bytes/20ms).
+2. Jitter buffer queueing, squelch detection, and underruns.
+3. Full P2P loopback RoIP-UDP audio frame transmission (648B) and heartbeats (8B).
+"""
+
+import math
+import os
+import struct
+import tempfile
+import threading
+import time
+import unittest
+import wave
+
+from roip_udp import (
+    ROIPUDP,
+    RoipPacket,
+    ROIP_MAGIC,
+    ROIP_DATA_SIZE,
+    ROIP_HEARTBEAT_SIZE,
+    AUDIO_PAYLOAD_SIZE,
+    FLAG_PTT,
+    FLAG_COS,
+)
+from udp_manager import UDPManager
+from tools.audio_simulator.audio_backend import (
+    SyntheticAudioBackend,
+    calculate_rms_db,
+    format_vu_meter,
+    BYTES_PER_FRAME,
+    SAMPLES_PER_FRAME,
+    SAMPLE_RATE,
+    CHANNELS,
+    SAMPLE_WIDTH,
+)
+from tools.audio_simulator.jitter_buffer import JitterBuffer
+
+
+class TestAudioBackend(unittest.TestCase):
+    """Verifies audio generation, math, and WAV file recording."""
+
+    def setUp(self):
+        self.backend = SyntheticAudioBackend(tone_freq=1000.0)
+        self.backend.start()
+
+    def tearDown(self):
+        self.backend.stop()
+
+    def test_frame_dimensions(self):
+        """Frame must be exactly 640 bytes representing 320 samples of 16-bit PCM."""
+        frame = self.backend.read_frame()
+        self.assertEqual(len(frame), BYTES_PER_FRAME)
+        self.assertEqual(len(frame), 640)
+
+        # Unpack as signed 16-bit integers
+        samples = struct.unpack(f"<{SAMPLES_PER_FRAME}h", frame)
+        self.assertEqual(len(samples), 320)
+        for s in samples:
+            self.assertGreaterEqual(s, -32768)
+            self.assertLessEqual(s, 32767)
+
+    def test_silence_mode(self):
+        """Silence mode should produce 640 null bytes."""
+        self.backend.tone_mode = "silence"
+        frame = self.backend.read_frame()
+        self.assertEqual(frame, b"\x00" * 640)
+        rms = calculate_rms_db(frame)
+        self.assertEqual(rms, -96.0)
+
+    def test_rms_calculation(self):
+        """Verify RMS calculation and VU meter string formatting."""
+        self.backend.tone_mode = "tone"
+        frame = self.backend.read_frame()
+        db = calculate_rms_db(frame)
+        # Expected around -6 to -7 dBFS for amplitude 16000
+        self.assertGreater(db, -10.0)
+        self.assertLess(db, 0.0)
+
+        vu_str = format_vu_meter(db)
+        self.assertIn("[", vu_str)
+        self.assertIn("dB", vu_str)
+
+    def test_wav_recording(self):
+        """Verify incoming frames can be recorded into a valid WAV file."""
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav_path = tf.name
+
+        try:
+            rec_backend = SyntheticAudioBackend(tone_freq=1000.0, record_path=wav_path)
+            rec_backend.start()
+
+            # Write 5 frames of test audio
+            for _ in range(5):
+                frame = rec_backend.read_frame()
+                rec_backend.write_frame(frame)
+
+            rec_backend.stop()
+
+            # Verify the WAV file on disk
+            with wave.open(wav_path, "rb") as wf:
+                self.assertEqual(wf.getnchannels(), 1)
+                self.assertEqual(wf.getsampwidth(), 2)
+                self.assertEqual(wf.getframerate(), 16000)
+                self.assertEqual(wf.getnframes(), 320 * 5)
+        finally:
+            if os.path.exists(wav_path):
+                os.remove(wav_path)
+
+
+class TestJitterBuffer(unittest.TestCase):
+    """Verifies jitter buffer queueing, delay thresholds, and squelch tracking."""
+
+    def test_queueing_and_playback(self):
+        jb = JitterBuffer(target_delay_frames=2, max_frames=10, squelch_timeout_s=0.2)
+
+        # Initially empty and buffering
+        self.assertEqual(jb.pop(), b"\x00" * 640)
+        self.assertFalse(jb.is_receiving)
+
+        # Push frame 1
+        frame1 = b"\x01\x00" * 320
+        jb.push(seq=0, pcm_data=frame1)
+        self.assertTrue(jb.is_receiving)
+        # Still buffering (target delay is 2)
+        self.assertEqual(jb.pop(), b"\x00" * 640)
+
+        # Push frame 2
+        frame2 = b"\x02\x00" * 320
+        jb.push(seq=1, pcm_data=frame2)
+
+        # Now buffer has reached target depth of 2, so popping releases frames
+        out1 = jb.pop()
+        self.assertEqual(out1, frame1)
+        out2 = jb.pop()
+        self.assertEqual(out2, frame2)
+
+        # Now empty: underrun occurs
+        out3 = jb.pop()
+        self.assertEqual(out3, b"\x00" * 640)
+        self.assertGreater(jb.underrun_count, 0)
+
+    def test_squelch_timeout(self):
+        jb = JitterBuffer(target_delay_frames=1, squelch_timeout_s=0.05)
+        jb.push(seq=0, pcm_data=b"\x00" * 640)
+        self.assertTrue(jb.is_receiving)
+
+        time.sleep(0.08)
+        self.assertFalse(jb.is_receiving)
+
+
+class TestRoipUdpLoopback(unittest.TestCase):
+    """Verifies real loopback transmission of RoIP 648B data and 8B heartbeat frames over UDP."""
+
+    def setUp(self):
+        self.udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        self.udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        self.roip_a = ROIPUDP(udp_manager=self.udp_a)
+        self.roip_b = ROIPUDP(udp_manager=self.udp_b)
+
+        # Connect directly to local loopback ports
+        self.udp_a.peer_addr = ("127.0.0.1", self.udp_b.local_port)
+        self.udp_a.candidate_addrs = [("127.0.0.1", self.udp_b.local_port)]
+        self.udp_a.connected = True
+        self.udp_a.running = True
+        self.udp_a._rx_thread = threading.Thread(target=self.udp_a._receive_loop, daemon=True)
+        self.udp_a._rx_thread.start()
+
+        self.udp_b.peer_addr = ("127.0.0.1", self.udp_a.local_port)
+        self.udp_b.candidate_addrs = [("127.0.0.1", self.udp_a.local_port)]
+        self.udp_b.connected = True
+        self.udp_b.running = True
+        self.udp_b._rx_thread = threading.Thread(target=self.udp_b._receive_loop, daemon=True)
+        self.udp_b._rx_thread.start()
+
+    def tearDown(self):
+        self.udp_a.stop()
+        self.udp_b.stop()
+
+    def test_roip_audio_data_packet_transfer(self):
+        received_packets = []
+        event = threading.Event()
+
+        def on_data_received(pkt: RoipPacket):
+            received_packets.append(pkt)
+            if len(received_packets) >= 10:
+                event.set()
+
+        self.roip_b.on_data_received = on_data_received
+
+        # Generate audio payload
+        backend = SyntheticAudioBackend(tone_freq=1000.0)
+        backend.start()
+
+        # Send 10 RoIP audio frames (each 648B = 8B header + 640B PCM)
+        for i in range(10):
+            pcm = backend.read_frame()
+            self.roip_a.send_data(payload=pcm, ptt=True, cos=False)
+            time.sleep(0.005)
+
+        backend.stop()
+        event.wait(timeout=2.0)
+
+        self.assertEqual(len(received_packets), 10)
+
+        # Validate packet fields
+        for idx, pkt in enumerate(received_packets):
+            self.assertEqual(pkt.magic, ROIP_MAGIC)
+            self.assertTrue(pkt.ptt)
+            self.assertFalse(pkt.cos)
+            self.assertEqual(pkt.sequence, idx)
+            self.assertEqual(len(pkt.payload), AUDIO_PAYLOAD_SIZE)
+            self.assertTrue(pkt.is_data)
+            self.assertFalse(pkt.is_heartbeat)
+
+    def test_roip_heartbeat_packet_transfer(self):
+        received_heartbeats = []
+        event = threading.Event()
+
+        def on_heartbeat_received(pkt: RoipPacket):
+            received_heartbeats.append(pkt)
+            if len(received_heartbeats) >= 3:
+                event.set()
+
+        self.roip_b.on_heartbeat_received = on_heartbeat_received
+
+        # Send 3 heartbeats (each 8 bytes)
+        for _ in range(3):
+            self.roip_a.send_heartbeat(ptt=False, cos=True)
+            time.sleep(0.005)
+
+        event.wait(timeout=2.0)
+
+        self.assertEqual(len(received_heartbeats), 3)
+        for idx, pkt in enumerate(received_heartbeats):
+            self.assertEqual(pkt.magic, ROIP_MAGIC)
+            self.assertFalse(pkt.ptt)
+            self.assertTrue(pkt.cos)
+            self.assertEqual(len(pkt.payload), 0)
+            self.assertTrue(pkt.is_heartbeat)
+            self.assertFalse(pkt.is_data)
+
+
+class TestSimulatorIntegration(unittest.TestCase):
+    """End-to-end integration test of the full RoipAudioSimulator engine."""
+
+    def test_simulator_burst_streaming(self):
+        from tools.audio_simulator.audio_app import RoipAudioSimulator
+
+        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        # Connect loopback
+        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
+        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
+        udp_a.connected = True
+        udp_a.running = True
+        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
+        udp_a._rx_thread.start()
+
+        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
+        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
+        udp_b.connected = True
+        udp_b.running = True
+        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
+        udp_b._rx_thread.start()
+
+        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth", tone_freq=1000.0)
+        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth", tone_freq=1000.0)
+
+        sim_a.start()
+        sim_b.start()
+
+        try:
+            # Trigger 200ms tone burst (~10 audio frames @ 50 fps)
+            sim_a.trigger_tone_burst(duration_s=0.25)
+            time.sleep(0.35)
+
+            # sim_b should have received audio frames and updated COS / PTT state
+            self.assertGreaterEqual(sim_b.rx_audio_frames, 5)
+            self.assertTrue(sim_b.last_rx_remote_ptt)
+            self.assertGreater(sim_b.last_rx_db, -20.0)
+        finally:
+            sim_a.stop()
+            sim_b.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3,3 +3,7 @@ __pycache__/
 *$py.class
 .wrangler/
 .env
+.venv/
+venv/
+*.venv/
+*.wav
