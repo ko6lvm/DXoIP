@@ -287,6 +287,49 @@ class TestSimulatorIntegration(unittest.TestCase):
             sim_a.stop()
             sim_b.stop()
 
+    def test_simulator_push_to_talk_key_unkey(self):
+        from tools.audio_simulator.audio_app import RoipAudioSimulator
+
+        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
+        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
+        udp_a.connected = True
+        udp_a.running = True
+        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
+        udp_a._rx_thread.start()
+
+        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
+        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
+        udp_b.connected = True
+        udp_b.running = True
+        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
+        udp_b._rx_thread.start()
+
+        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth", tone_freq=1000.0)
+        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth", tone_freq=1000.0)
+
+        sim_a.start()
+        sim_b.start()
+
+        try:
+            # Press PTT
+            sim_a.key_ptt()
+            self.assertTrue(sim_a.is_transmitting)
+            time.sleep(0.2)
+            self.assertTrue(sim_b.last_rx_remote_ptt)
+            self.assertGreaterEqual(sim_b.rx_audio_frames, 4)
+
+            # Release PTT
+            sim_a.unkey_ptt()
+            self.assertFalse(sim_a.is_transmitting)
+            time.sleep(0.1)
+            self.assertFalse(sim_b.last_rx_remote_ptt)
+        finally:
+            sim_a.stop()
+            sim_b.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

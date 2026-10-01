@@ -158,13 +158,24 @@ def main():
                 seq = roip.send_heartbeat(ptt=ptt_state, cos=cos_state)
                 print(f"[--> Sent Heartbeat] Seq: {seq} (8 bytes)")
 
-            elif line.lower() == "/ptt":
-                ptt_state = not ptt_state
-                state_str = "ON (Transmitting)" if ptt_state else "OFF (Receiving)"
-                print(f"[*] PTT toggled to: {state_str}")
-                # Transmit a heartbeat with the new PTT flag
-                seq = roip.send_heartbeat(ptt=ptt_state, cos=cos_state)
-                print(f"[--> Sent Heartbeat with PTT={ptt_state}] Seq: {seq}")
+            elif line.lower().startswith("/ptt") or line.lower().startswith("/talk"):
+                parts = line.split()
+                if len(parts) > 1 and parts[1].replace(".", "", 1).isdigit():
+                    sec = float(parts[1])
+                    print(f"[*] Keying PTT for {sec}s (Push-to-Talk)...")
+                    ptt_state = True
+                    roip.send_heartbeat(ptt=True, cos=cos_state)
+                    time.sleep(sec)
+                    ptt_state = False
+                    roip.send_heartbeat(ptt=False, cos=cos_state)
+                    print(f"[*] PTT unkeyed.")
+                else:
+                    ptt_state = not ptt_state
+                    state_str = "ON (Transmitting)" if ptt_state else "OFF (Receiving)"
+                    print(f"[*] PTT toggled to: {state_str}")
+                    # Transmit a heartbeat with the new PTT flag
+                    seq = roip.send_heartbeat(ptt=ptt_state, cos=cos_state)
+                    print(f"[--> Sent Heartbeat with PTT={ptt_state}] Seq: {seq}")
 
             else:
                 # Encode text into 640-byte audio payload

@@ -20,9 +20,10 @@ A standalone test application for testing real-time **16 kHz 16-bit linear PCM a
   * Visual ASCII VU meter for Tx/Rx audio levels (dBFS).
   * Instant PTT status (KEYED vs IDLE) and remote COS status.
   * Jitter buffer queue depth and packet counters.
-* **Interactive Hotkeys:**
-  * `[SPACE]` or `[P]`: Toggle PTT (Key / Unkey transmitter).
-  * `[T]`: Trigger 1-second 1 kHz test tone burst (useful for rapid link and audio path checks).
+* **Interactive Controls:**
+  * **Push-to-Talk (Terminal):** Press and **hold** `[SPACE]` or `[P]` to transmit. When you release, it automatically unkeys!
+  * **Push-to-Talk (GUI):** Run with `--gui` to launch a graphical window with a large mouse/spacebar "HOLD TO TALK" button and visual meters.
+  * `[T]`: Trigger 1-second 1 kHz test tone burst (useful for rapid audio path checks).
   * `[H]`: Send 8-byte Heartbeat packet.
   * `[Q]`: Quit cleanly.
 

@@ -220,11 +220,26 @@ class RoipAudioSimulator:
         """Triggers a temporary PTT transmission burst with a test tone."""
         self.burst_active_until = time.time() + duration_s
 
+    def key_ptt(self):
+        """Activates PTT (Push-to-Talk pressed)."""
+        if not self.ptt_active:
+            self.ptt_active = True
+            # Send an immediate heartbeat with PTT=True
+            self.roip.send_heartbeat(ptt=True, cos=self.jitter_buffer.is_receiving)
+
+    def unkey_ptt(self):
+        """Deactivates PTT (Push-to-Talk released)."""
+        if self.ptt_active:
+            self.ptt_active = False
+            # Send an immediate heartbeat with PTT=False
+            self.roip.send_heartbeat(ptt=False, cos=self.jitter_buffer.is_receiving)
+
     def toggle_ptt(self):
-        """Toggles manual PTT state."""
-        self.ptt_active = not self.ptt_active
-        # Send an immediate heartbeat/state change
-        self.roip.send_heartbeat(ptt=self.ptt_active, cos=self.jitter_buffer.is_receiving)
+        """Toggles PTT state (for automated scripts or backwards compatibility)."""
+        if self.ptt_active:
+            self.unkey_ptt()
+        else:
+            self.key_ptt()
 
 
 def print_dashboard(sim: RoipAudioSimulator):
@@ -257,7 +272,7 @@ def print_dashboard(sim: RoipAudioSimulator):
         f" Jitter Queued  : {sim.jitter_buffer.queued_frames:<6} | Underruns    : {sim.jitter_buffer.underrun_count:<6}\n"
     )
     sys.stdout.write("======================================================================\n")
-    sys.stdout.write(" Controls: [SPACE/P] Toggle PTT | [T] 1s Tone Burst | [H] Heartbeat | [Q] Quit\n")
+    sys.stdout.write(" Controls: [HOLD SPACE/P] Push-to-Talk | [T] 1s Tone Burst | [H] Heartbeat | [Q] Quit\n")
     sys.stdout.flush()
 
 
@@ -275,6 +290,8 @@ def main():
     parser.add_argument("--wav-play", type=str, default=None, help="Path to 16kHz mono WAV file to transmit on PTT")
     parser.add_argument("--wav-record", type=str, default=None, help="Path to record received PCM audio as WAV")
     parser.add_argument("--auto-ptt", type=float, default=0.0, help="Automated PTT toggle interval in seconds (0 = disabled)")
+    parser.add_argument("--gui", action="store_true", help="Launch graphical Push-to-Talk UI window")
+    parser.add_argument("--ptt-hold-timeout", type=float, default=0.5, help="Hold timeout in seconds for terminal Push-to-Talk (default: 0.5s)")
     args = parser.parse_args()
 
     endian_char = "!" if args.endian == "big" else "<"
@@ -368,19 +385,41 @@ def main():
 
         threading.Thread(target=auto_ptt_worker, daemon=True, name="AutoPTT").start()
 
-    # 4. Interactive Loop
+    # Launch GUI if requested and available
+    if args.gui:
+        try:
+            from tools.audio_simulator.gui import launch_gui, TKINTER_AVAILABLE
+            if not TKINTER_AVAILABLE or not os.environ.get("DISPLAY"):
+                print("[!] GUI requested but Tkinter or DISPLAY is not available.")
+                print("[*] Falling back to interactive Terminal Push-to-Talk mode.\n")
+            else:
+                print("[*] Launching graphical Push-to-Talk window...")
+                launch_gui(sim)
+                return
+        except Exception as e:
+            print(f"[!] Could not launch GUI ({e}). Falling back to terminal Push-to-Talk mode.\n")
+
+    # 4. Interactive Loop (Push-to-Talk: Hold SPACE/P to talk, release to unkey)
+    PTT_HOLD_TIMEOUT = args.ptt_hold_timeout
+    last_ptt_press_time = 0.0
+
     try:
         with TerminalController() as term:
             last_dashboard_update = 0.0
             while sim.running and udp_mgr.connected:
                 now = time.time()
+
+                # Push-to-Talk: Automatically unkey when key release timeout is reached
+                if sim.ptt_active and (now - last_ptt_press_time > PTT_HOLD_TIMEOUT):
+                    sim.unkey_ptt()
+
                 # Update dashboard ~5 times/second
                 if now - last_dashboard_update >= 0.2:
                     if term.is_tty:
                         print_dashboard(sim)
                     last_dashboard_update = now
 
-                key = term.get_key(timeout=0.05)
+                key = term.get_key(timeout=0.03)
                 if not key:
                     continue
 
@@ -388,7 +427,8 @@ def main():
                 if key_lower in ("q", "\x03"):  # 'q' or Ctrl-C
                     break
                 elif key_lower in (" ", "p"):
-                    sim.toggle_ptt()
+                    last_ptt_press_time = time.time()
+                    sim.key_ptt()
                 elif key_lower == "t":
                     sim.trigger_tone_burst(duration_s=1.0)
                 elif key_lower == "h":
