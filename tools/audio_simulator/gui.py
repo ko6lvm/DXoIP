@@ -23,8 +23,17 @@ def launch_gui(sim):
 
     root = tk.Tk()
     root.title("DXoIP RoIP Audio Simulator")
-    root.geometry("450x420")
+    root.geometry("450x440")
     root.resizable(False, False)
+
+    # Bring window to front across macOS and other desktop platforms
+    root.lift()
+    try:
+        root.attributes("-topmost", True)
+        root.after_idle(root.attributes, "-topmost", False)
+        root.focus_force()
+    except Exception:
+        pass
 
     # Style
     style = ttk.Style()
@@ -37,8 +46,12 @@ def launch_gui(sim):
     title_lbl = ttk.Label(header_frame, text="DXoIP RoIP Audio Simulator", font=("Helvetica", 14, "bold"))
     title_lbl.pack(anchor="w")
 
-    peer_str = f"Peer: {sim.udp_manager.peer_addr[0]}:{sim.udp_manager.peer_addr[1]}" if sim.udp_manager.peer_addr else "Peer: Not connected"
-    peer_lbl = ttk.Label(header_frame, text=peer_str, font=("Helvetica", 10))
+    status_var = tk.StringVar(value="Status: Waiting for peer to connect...")
+    status_lbl = ttk.Label(header_frame, textvariable=status_var, font=("Helvetica", 10, "bold"), foreground="#e65100")
+    status_lbl.pack(anchor="w")
+
+    peer_var = tk.StringVar(value="Peer: Connecting...")
+    peer_lbl = ttk.Label(header_frame, textvariable=peer_var, font=("Helvetica", 9))
     peer_lbl.pack(anchor="w")
 
     backend_lbl = ttk.Label(header_frame, text=f"Audio Engine: {sim.audio_backend.__class__.__name__}", font=("Helvetica", 9, "italic"))
@@ -135,7 +148,15 @@ def launch_gui(sim):
     def update_gui():
         if not sim.running:
             root.destroy()
-            return
+        # Update connection status & peer endpoint
+        if sim.udp_manager.connected and sim.udp_manager.peer_addr:
+            status_var.set("Status: CONNECTED (P2P Link Active)")
+            status_lbl.config(foreground="#2e7d32")
+            peer_var.set(f"Peer: {sim.udp_manager.peer_addr[0]}:{sim.udp_manager.peer_addr[1]}")
+        else:
+            status_var.set("Status: Waiting for peer to connect...")
+            status_lbl.config(foreground="#e65100")
+            peer_var.set("Peer: Connecting...")
 
         # Update Carrier squelch
         if sim.jitter_buffer.is_receiving:
