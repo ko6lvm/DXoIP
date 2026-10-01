@@ -46,6 +46,13 @@ class TerminalController:
         self.old_settings = None
 
     def __enter__(self):
+        if self.interactive:
+            try:
+                sys.stdout.write("\033[?25l")  # Hide cursor to prevent cursor flicker
+                sys.stdout.flush()
+            except Exception:
+                pass
+
         if self.is_windows:
             self.interactive = self.is_tty
             return self
@@ -62,6 +69,13 @@ class TerminalController:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.interactive:
+            try:
+                sys.stdout.write("\033[?25h\n")  # Restore cursor
+                sys.stdout.flush()
+            except Exception:
+                pass
+
         if not self.is_windows and self.is_tty and self.old_settings:
             try:
                 import termios
@@ -383,30 +397,28 @@ def print_dashboard(sim: RoipAudioSimulator):
 
     backend_name = sim.audio_backend.__class__.__name__
 
-    sys.stdout.write("\033[H\033[J")  # Clear screen and move cursor to top-left
-    sys.stdout.write("======================================================================\n")
-    sys.stdout.write("                 DXoIP ROIP-UDP SIMPLEX RADIO SIMULATOR               \n")
-    sys.stdout.write("======================================================================\n")
-    sys.stdout.write(f" Backend       : {backend_name}\n")
-    sys.stdout.write(f" Peer Endpoint : {sim.udp_manager.peer_addr[0]}:{sim.udp_manager.peer_addr[1]}\n")
-    sys.stdout.write(f" Radio Mode    : [ {operating_state:<20} ]\n")
-    sys.stdout.write(f" Channel Status: [ {channel_status:<38} ]\n")
-    sys.stdout.write(f" Remote PTT    : [ {remote_ptt:<6} ] | BCLO: [{bclo_mode}] | Roger Beep: [{roger_mode}]\n")
-    sys.stdout.write("----------------------------------------------------------------------\n")
-    sys.stdout.write(f" Mic/Tx Audio  : {format_vu_meter(sim.last_tx_db)}\n")
-    sys.stdout.write(f" Spk/Rx Audio  : {format_vu_meter(sim.last_rx_db)}\n")
-    sys.stdout.write("----------------------------------------------------------------------\n")
-    sys.stdout.write(
-        f" Tx Audio Frames: {sim.tx_audio_frames:<6} | Tx Heartbeats: {sim.tx_heartbeats:<6}\n"
-    )
-    sys.stdout.write(
-        f" Rx Audio Frames: {sim.rx_audio_frames:<6} | Rx Heartbeats: {sim.rx_heartbeats:<6}\n"
-    )
-    sys.stdout.write(
-        f" Jitter Queued  : {sim.jitter_buffer.queued_frames:<6} | Underruns    : {sim.jitter_buffer.underrun_count:<6}\n"
-    )
-    sys.stdout.write("======================================================================\n")
-    sys.stdout.write(" Controls: [HOLD SPACE/P] Push-to-Talk | [T] 1s Tone Burst | [H] Heartbeat | [Q] Quit\n")
+    lines = [
+        "\033[H",  # Move cursor to top-left without wiping the display (eliminates Windows flicker)
+        "======================================================================\033[K\n",
+        "                 DXoIP ROIP-UDP SIMPLEX RADIO SIMULATOR               \033[K\n",
+        "======================================================================\033[K\n",
+        f" Backend       : {backend_name}\033[K\n",
+        f" Peer Endpoint : {sim.udp_manager.peer_addr[0]}:{sim.udp_manager.peer_addr[1]}\033[K\n",
+        f" Radio Mode    : [ {operating_state:<20} ]\033[K\n",
+        f" Channel Status: [ {channel_status:<38} ]\033[K\n",
+        f" Remote PTT    : [ {remote_ptt:<6} ] | BCLO: [{bclo_mode}] | Roger Beep: [{roger_mode}]\033[K\n",
+        "----------------------------------------------------------------------\033[K\n",
+        f" Mic/Tx Audio  : {format_vu_meter(sim.last_tx_db)}\033[K\n",
+        f" Spk/Rx Audio  : {format_vu_meter(sim.last_rx_db)}\033[K\n",
+        "----------------------------------------------------------------------\033[K\n",
+        f" Tx Audio Frames: {sim.tx_audio_frames:<6} | Tx Heartbeats: {sim.tx_heartbeats:<6}\033[K\n",
+        f" Rx Audio Frames: {sim.rx_audio_frames:<6} | Rx Heartbeats: {sim.rx_heartbeats:<6}\033[K\n",
+        f" Jitter Queued  : {sim.jitter_buffer.queued_frames:<6} | Underruns    : {sim.jitter_buffer.underrun_count:<6}\033[K\n",
+        "======================================================================\033[K\n",
+        " Controls: [HOLD SPACE/P] Push-to-Talk | [T] 1s Tone Burst | [H] Heartbeat | [Q] Quit\033[K\n",
+        "\033[J",  # Clear anything remaining below dashboard
+    ]
+    sys.stdout.write("".join(lines))
     sys.stdout.flush()
 
 
@@ -536,8 +548,10 @@ def main():
 
         try:
             with TerminalController() as term:
-                # Immediate initial dashboard display
+                # Immediate initial dashboard display (clear once on start)
                 if term.interactive:
+                    sys.stdout.write("\033[2J\033[H")
+                    sys.stdout.flush()
                     print_dashboard(sim)
 
                 last_dashboard_update = time.time()
