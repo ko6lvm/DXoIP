@@ -290,7 +290,6 @@ def main():
     parser.add_argument("--wav-play", type=str, default=None, help="Path to 16kHz mono WAV file to transmit on PTT")
     parser.add_argument("--wav-record", type=str, default=None, help="Path to record received PCM audio as WAV")
     parser.add_argument("--auto-ptt", type=float, default=0.0, help="Automated PTT toggle interval in seconds (0 = disabled)")
-    parser.add_argument("--gui", action="store_true", help="Launch graphical Push-to-Talk UI window")
     parser.add_argument("--ptt-hold-timeout", type=float, default=0.5, help="Hold timeout in seconds for terminal Push-to-Talk (default: 0.5s)")
     args = parser.parse_args()
 
@@ -352,12 +351,17 @@ def main():
 
     connect_thread.start()
 
-    import platform
+    # Wait for connection
+    print("[*] Waiting for P2P connection to establish...")
+    while not udp_mgr.connected and connect_thread.is_alive():
+        time.sleep(0.1)
 
-    def has_gui_display():
-        if platform.system() in ("Darwin", "Windows"):
-            return True
-        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    if not udp_mgr.connected:
+        print("[!] Connection failed or timed out.")
+        udp_mgr.stop()
+        sys.exit(1)
+
+    print(f"\n[+] CONNECTED to peer: {udp_mgr.peer_addr[0]}:{udp_mgr.peer_addr[1]}\n")
 
     # 3. Initialize Audio Simulator
     sim = RoipAudioSimulator(
@@ -370,32 +374,6 @@ def main():
         auto_ptt_interval=args.auto_ptt,
     )
     sim.start()
-
-    # Launch GUI immediately if requested and available
-    if args.gui:
-        try:
-            from tools.audio_simulator.gui import launch_gui, TKINTER_AVAILABLE
-            if not TKINTER_AVAILABLE or not has_gui_display():
-                print("[!] GUI requested but Tkinter or desktop display is not available.")
-                print("[*] Falling back to interactive Terminal Push-to-Talk mode.\n")
-            else:
-                print("[*] Launching graphical Push-to-Talk window...")
-                launch_gui(sim)
-                return
-        except Exception as e:
-            print(f"[!] Could not launch GUI ({e}). Falling back to terminal Push-to-Talk mode.\n")
-
-    # In terminal mode, wait for P2P connection before opening dashboard
-    print("[*] Waiting for P2P connection to establish...")
-    while not udp_mgr.connected and connect_thread.is_alive():
-        time.sleep(0.1)
-
-    if not udp_mgr.connected:
-        print("[!] Connection failed or timed out.")
-        sim.stop()
-        sys.exit(1)
-
-    print(f"\n[+] CONNECTED to peer: {udp_mgr.peer_addr[0]}:{udp_mgr.peer_addr[1]}\n")
 
     # Automated PTT thread if requested
     if args.auto_ptt > 0:
