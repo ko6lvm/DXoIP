@@ -106,21 +106,32 @@ python peer.py --room 1234
 python peer.py --room 1234
 ```
 
-### Interactive CLI Commands
-Once connected, the CLI accepts:
-* `<text> + Enter`: Transmits a **648-byte RoIP Data packet** containing the payload.
-* `/ptt`: Toggles PTT on/off and immediately sends an updated **8-byte Heartbeat packet**.
-* `/h` or `/heartbeat`: Sends an **8-byte Heartbeat packet**.
-* `exit`: Gracefully terminates the session and notifies the peer.
+### Establishing P2P Connection
+Once both peers run `peer.py --room 1234`, they query STUN, discover their public reflexive and local endpoints, exchange them via the matchmaker, and punch a direct UDP hole.
+
+```text
+==========================================
+ PUBLIC (WAN) ENDPOINT : 198.51.100.1:45123
+ LOCAL (LAN) ENDPOINT  : 192.168.1.50:45123
+==========================================
+
+[+] SUCCESS! Direct UDP Hole Punched and P2P Session Established!
+[+] Active Peer Endpoint: 203.0.113.10:52341
+[*] Connection active. Press Ctrl+C to disconnect.
+```
+
+To test full-duplex 16 kHz audio streaming and Push-to-Talk, use the dedicated [Audio Simulator](tools/audio_simulator/README.md):
+```bash
+python tools/audio_simulator/audio_app.py --room 1234
+```
 
 ---
 
-## CLI Reference
+## CLI Reference (`peer.py`)
 
 ```text
 usage: peer.py [-h] [--port PORT] [--server SERVER] [--room ROOM]
                [--peer PEER] [--stun STUN] [--stun-port STUN_PORT]
-               [--endian {big,little}]
 
 options:
   -h, --help            Show this help message and exit
@@ -130,7 +141,6 @@ options:
   --peer PEER           Direct remote endpoint (<IP>:<Port>) for manual punch without matchmaker
   --stun STUN           STUN server hostname (default: stun.l.google.com)
   --stun-port STUN_PORT STUN server port (default: 19302)
-  --endian {big,little} Header endianness (default: big / network byte order)
 ```
 
 ---
