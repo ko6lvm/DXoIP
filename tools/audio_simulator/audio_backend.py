@@ -58,6 +58,29 @@ def format_vu_meter(db: float, width: int = 15) -> str:
     return f"[{bar}] {db:5.1f} dB"
 
 
+def generate_tone_frames(freq: float = 1200.0, duration_ms: int = 80, amplitude: int = 12000) -> list:
+    """
+    Generates a list of 20ms PCM audio frames (each 640 bytes) containing a sine tone.
+    Used for radio roger beeps, courtesy tones, and channel busy alert tones.
+    """
+    total_samples = int(SAMPLE_RATE * (duration_ms / 1000.0))
+    frames = []
+    samples = []
+    for i in range(total_samples):
+        t = i / SAMPLE_RATE
+        val = int(amplitude * math.sin(2.0 * math.pi * freq * t))
+        samples.append(max(-32768, min(32767, val)))
+        if len(samples) == SAMPLES_PER_FRAME:
+            frames.append(struct.pack(f"<{SAMPLES_PER_FRAME}h", *samples))
+            samples = []
+
+    if samples:
+        samples += [0] * (SAMPLES_PER_FRAME - len(samples))
+        frames.append(struct.pack(f"<{SAMPLES_PER_FRAME}h", *samples))
+
+    return frames
+
+
 class AudioBackend:
     """Abstract base class for audio backends."""
 

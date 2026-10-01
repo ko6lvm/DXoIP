@@ -12,6 +12,7 @@ import argparse
 import os
 import select
 import sys
+import collections
 import threading
 import time
 from pathlib import Path
@@ -27,6 +28,7 @@ from tools.audio_simulator.audio_backend import (
     get_audio_backend,
     calculate_rms_db,
     format_vu_meter,
+    generate_tone_frames,
     BYTES_PER_FRAME,
     FRAME_DURATION_MS,
     SAMPLE_RATE,
@@ -92,6 +94,8 @@ class RoipAudioSimulator:
         wav_play_path: str = None,
         wav_record_path: str = None,
         auto_ptt_interval: float = 0.0,
+        busy_channel_lockout: bool = True,
+        roger_beep: bool = True,
     ):
         self.udp_manager = udp_manager
         self.roip = ROIPUDP(udp_manager=self.udp_manager, endianness=endianness)
@@ -105,11 +109,15 @@ class RoipAudioSimulator:
 
         self.jitter_buffer = JitterBuffer(target_delay_frames=2, max_frames=20)
         self.auto_ptt_interval = auto_ptt_interval
+        self.busy_channel_lockout = busy_channel_lockout
+        self.roger_beep = roger_beep
 
-        # State flags
+        # Simplex State flags
         self.ptt_active = False
         self.burst_active_until = 0.0
         self.running = False
+        self.lockout_notice_until = 0.0
+        self._alert_frames = collections.deque()
 
         # Stats & Metrics
         self.tx_audio_frames = 0
@@ -126,24 +134,42 @@ class RoipAudioSimulator:
         self.roip.on_data_received = self._on_roip_data
         self.roip.on_heartbeat_received = self._on_roip_heartbeat
 
-    def _on_roip_data(self, packet: RoipPacket):
-        self.rx_audio_frames += 1
-        self.last_rx_remote_ptt = packet.ptt
-        self.last_rx_remote_cos = packet.cos
-        self.last_rx_db = calculate_rms_db(packet.payload)
-
-        # Push audio payload into jitter buffer for playback
-        self.jitter_buffer.push(packet.sequence, packet.payload, packet.timestamp)
-
-    def _on_roip_heartbeat(self, packet: RoipPacket):
-        self.rx_heartbeats += 1
-        self.last_rx_remote_ptt = packet.ptt
-        self.last_rx_remote_cos = packet.cos
+    @property
+    def is_channel_busy(self) -> bool:
+        """Returns True if the simplex channel is occupied (remote station transmitting)."""
+        return self.jitter_buffer.is_receiving or self.last_rx_remote_ptt
 
     @property
     def is_transmitting(self) -> bool:
-        """Returns True if PTT is keyed either manually or during a burst test."""
+        """Returns True if local PTT is keyed or a test burst is actively transmitting."""
         return self.ptt_active or (time.time() < self.burst_active_until)
+
+    def _on_roip_data(self, packet: RoipPacket):
+        self.rx_audio_frames += 1
+        remote_dropped_ptt = (self.last_rx_remote_ptt and not packet.ptt)
+        self.last_rx_remote_ptt = packet.ptt
+        self.last_rx_remote_cos = packet.cos
+
+        # Simplex radio rule: if local station is actively transmitting, RX is blinded
+        if not self.is_transmitting:
+            self.last_rx_db = calculate_rms_db(packet.payload)
+            self.jitter_buffer.push(packet.sequence, packet.payload, packet.timestamp)
+
+        # Courtesy Roger Beep when remote station finishes transmitting
+        if remote_dropped_ptt and self.roger_beep and not self.is_transmitting:
+            for f in generate_tone_frames(freq=1200.0, duration_ms=80, amplitude=12000):
+                self._alert_frames.append(f)
+
+    def _on_roip_heartbeat(self, packet: RoipPacket):
+        self.rx_heartbeats += 1
+        remote_dropped_ptt = (self.last_rx_remote_ptt and not packet.ptt)
+        self.last_rx_remote_ptt = packet.ptt
+        self.last_rx_remote_cos = packet.cos
+
+        # Courtesy Roger Beep when remote station releases PTT
+        if remote_dropped_ptt and self.roger_beep and not self.is_transmitting:
+            for f in generate_tone_frames(freq=1200.0, duration_ms=80, amplitude=12000):
+                self._alert_frames.append(f)
 
     def start(self):
         self.running = True
@@ -171,19 +197,19 @@ class RoipAudioSimulator:
 
         while self.running and self.udp_manager.connected:
             now = time.time()
-            cos_state = self.jitter_buffer.is_receiving
 
             if self.is_transmitting:
                 # Capture 320 samples (640 bytes) of PCM audio
                 pcm_data = self.audio_backend.read_frame()
                 self.last_tx_db = calculate_rms_db(pcm_data)
 
-                # Transmit 648-byte RoIP Data packet
-                self.roip.send_data(payload=pcm_data, ptt=True, cos=cos_state)
+                # Simplex radio rule: transmitting RF squelches local receiver (COS=False)
+                self.roip.send_data(payload=pcm_data, ptt=True, cos=False)
                 self.tx_audio_frames += 1
 
             else:
                 # Idle: send 8-byte heartbeat at ~1 Hz keepalive
+                cos_state = self.jitter_buffer.is_receiving
                 if now - last_heartbeat_time >= 1.0:
                     self.roip.send_heartbeat(ptt=False, cos=cos_state)
                     self.tx_heartbeats += 1
@@ -200,14 +226,31 @@ class RoipAudioSimulator:
 
     def _rx_playback_loop(self):
         """
-        Pulls decoded PCM frames from the JitterBuffer at 50 Hz and streams to output.
+        Pulls decoded PCM frames at 50 Hz and streams to output.
+        Enforces simplex rule: local transmission mutes receiver playback.
         """
         frame_interval_s = FRAME_DURATION_MS / 1000.0
         next_deadline = time.time()
 
         while self.running and self.udp_manager.connected:
-            frame = self.jitter_buffer.pop()
-            self.audio_backend.write_frame(frame)
+            if self.is_transmitting:
+                # Simplex radio rule: transmitting mutes receiver speaker to prevent feedback
+                _ = self.jitter_buffer.pop()
+                self.audio_backend.write_frame(b"\x00" * BYTES_PER_FRAME)
+                self.last_rx_db = -96.0
+            else:
+                # Play courtesy roger beep if queued
+                if self._alert_frames:
+                    frame = self._alert_frames.popleft()
+                    self.audio_backend.write_frame(frame)
+                    self.last_rx_db = calculate_rms_db(frame)
+                else:
+                    frame = self.jitter_buffer.pop()
+                    self.audio_backend.write_frame(frame)
+                    if self.jitter_buffer.is_receiving:
+                        self.last_rx_db = calculate_rms_db(frame)
+                    else:
+                        self.last_rx_db = -96.0
 
             next_deadline += frame_interval_s
             sleep_time = next_deadline - time.time()
@@ -216,16 +259,29 @@ class RoipAudioSimulator:
             else:
                 next_deadline = time.time()
 
-    def trigger_tone_burst(self, duration_s: float = 1.0):
+    def trigger_tone_burst(self, duration_s: float = 1.0) -> bool:
         """Triggers a temporary PTT transmission burst with a test tone."""
+        if self.busy_channel_lockout and self.is_channel_busy:
+            self.lockout_notice_until = time.time() + 1.2
+            return False
         self.burst_active_until = time.time() + duration_s
+        return True
 
-    def key_ptt(self):
-        """Activates PTT (Push-to-Talk pressed)."""
+    def key_ptt(self) -> bool:
+        """
+        Activates PTT (Push-to-Talk pressed).
+        Enforces Busy Channel Lockout (BCLO) in simplex radio mode.
+        Returns True if PTT keyed, False if locked out by active channel.
+        """
+        if self.busy_channel_lockout and self.is_channel_busy:
+            self.lockout_notice_until = time.time() + 1.2
+            return False
+
         if not self.ptt_active:
             self.ptt_active = True
-            # Send an immediate heartbeat with PTT=True
-            self.roip.send_heartbeat(ptt=True, cos=self.jitter_buffer.is_receiving)
+            # In simplex: transmitting RF disables our receiver (COS=False)
+            self.roip.send_heartbeat(ptt=True, cos=False)
+        return True
 
     def unkey_ptt(self):
         """Deactivates PTT (Push-to-Talk released)."""
@@ -234,30 +290,47 @@ class RoipAudioSimulator:
             # Send an immediate heartbeat with PTT=False
             self.roip.send_heartbeat(ptt=False, cos=self.jitter_buffer.is_receiving)
 
-    def toggle_ptt(self):
-        """Toggles PTT state (for automated scripts or backwards compatibility)."""
+    def toggle_ptt(self) -> bool:
+        """Toggles PTT state."""
         if self.ptt_active:
             self.unkey_ptt()
+            return False
         else:
-            self.key_ptt()
+            return self.key_ptt()
 
 
 def print_dashboard(sim: RoipAudioSimulator):
-    """Renders a clean real-time status dashboard."""
-    tx_state = "KEYED (TX)" if sim.is_transmitting else "IDLE"
-    rx_carrier = "CARRIER DETECTED (COS)" if sim.jitter_buffer.is_receiving else "SQUELCH CLOSED"
+    """Renders a clean real-time status dashboard reflecting simplex radio state."""
+    now = time.time()
+    if sim.is_transmitting:
+        operating_state = "TX (TRANSMITTING)"
+        channel_status = "TRANSMIT ACTIVE (Local RX Muted)"
+    elif sim.is_channel_busy:
+        if now < sim.lockout_notice_until:
+            operating_state = "BUSY LOCKOUT"
+            channel_status = "TRANSMIT INHIBITED (Channel Busy!)"
+        else:
+            operating_state = "RX (RECEIVING)"
+            channel_status = "CARRIER DETECTED (Squelch Open)"
+    else:
+        operating_state = "STANDBY"
+        channel_status = "SQUELCH CLOSED (Channel Clear)"
+
     remote_ptt = "KEYED" if sim.last_rx_remote_ptt else "OFF"
+    bclo_mode = "ON" if sim.busy_channel_lockout else "OFF"
+    roger_mode = "ON" if sim.roger_beep else "OFF"
 
     backend_name = sim.audio_backend.__class__.__name__
 
     sys.stdout.write("\033[H\033[J")  # Clear screen and move cursor to top-left
     sys.stdout.write("======================================================================\n")
-    sys.stdout.write("                 DXoIP ROIP-UDP AUDIO SIMULATOR                       \n")
+    sys.stdout.write("                 DXoIP ROIP-UDP SIMPLEX RADIO SIMULATOR               \n")
     sys.stdout.write("======================================================================\n")
     sys.stdout.write(f" Backend       : {backend_name}\n")
     sys.stdout.write(f" Peer Endpoint : {sim.udp_manager.peer_addr[0]}:{sim.udp_manager.peer_addr[1]}\n")
-    sys.stdout.write(f" Local PTT     : [ {tx_state:<10} ] | Remote PTT: [ {remote_ptt:<6} ]\n")
-    sys.stdout.write(f" Local COS     : [ {rx_carrier:<22} ]\n")
+    sys.stdout.write(f" Radio Mode    : [ {operating_state:<20} ]\n")
+    sys.stdout.write(f" Channel Status: [ {channel_status:<38} ]\n")
+    sys.stdout.write(f" Remote PTT    : [ {remote_ptt:<6} ] | BCLO: [{bclo_mode}] | Roger Beep: [{roger_mode}]\n")
     sys.stdout.write("----------------------------------------------------------------------\n")
     sys.stdout.write(f" Mic/Tx Audio  : {format_vu_meter(sim.last_tx_db)}\n")
     sys.stdout.write(f" Spk/Rx Audio  : {format_vu_meter(sim.last_rx_db)}\n")
@@ -291,6 +364,8 @@ def main():
     parser.add_argument("--wav-record", type=str, default=None, help="Path to record received PCM audio as WAV")
     parser.add_argument("--auto-ptt", type=float, default=0.0, help="Automated PTT toggle interval in seconds (0 = disabled)")
     parser.add_argument("--ptt-hold-timeout", type=float, default=0.5, help="Hold timeout in seconds for terminal Push-to-Talk (default: 0.5s)")
+    parser.add_argument("--allow-doubling", action="store_true", help="Disable Busy Channel Lockout (allow simultaneous transmitting)")
+    parser.add_argument("--no-roger-beep", action="store_true", help="Disable courtesy tone / roger beep on remote unkey")
     args = parser.parse_args()
 
     endian_char = "!" if args.endian == "big" else "<"
@@ -372,6 +447,8 @@ def main():
         wav_play_path=args.wav_play,
         wav_record_path=args.wav_record,
         auto_ptt_interval=args.auto_ptt,
+        busy_channel_lockout=not args.allow_doubling,
+        roger_beep=not args.no_roger_beep,
     )
     sim.start()
 

@@ -13,13 +13,17 @@ A standalone test application for testing real-time **16 kHz 16-bit linear PCM a
   * Streams 648-byte RoIP Data packets (8-byte header + 640-byte 16-bit mono PCM @ 16 kHz) at 50 packets/sec (20ms frames).
   * Evaluates and transmits continuous PTT and COS flags on every frame.
   * Sends 8-byte Heartbeat packets during radio idle / unkeyed state.
+* **Authentic Simplex (Half-Duplex) Radio Emulation:**
+  * **TX Mutes RX:** While transmitting, local speaker playback is muted to eliminate acoustic feedback and mirror physical two-way radio behavior.
+  * **Busy Channel Lockout (BCLO):** While incoming audio carrier (`COS`) is detected, local PTT is locked out to prevent "doubling" on the simplex channel (can be overridden with `--allow-doubling`).
+  * **Courtesy Roger Beep:** Plays a distinct 80ms 1200 Hz tone when the remote peer unkeys, signaling the channel is clear.
 * **Dual-Mode Audio Engine:**
   * **Live Hardware Audio (`mode=live`):** Streams from your physical microphone and plays out to your speakers using `sounddevice` (when hardware and `libportaudio2` are available).
   * **Synthetic Audio / File Engine (`mode=synth`):** Built-in zero-dependency generator producing 1 kHz sine wave test tones, roger beeps, or playing from 16 kHz WAV files. Can also record received audio to `.wav`.
 * **Real-time Terminal Dashboard:**
+  * Displays Radio Mode (`TX`, `RX`, `STANDBY`, `BUSY LOCKOUT`).
   * Visual ASCII VU meter for Tx/Rx audio levels (dBFS).
-  * Instant PTT status (KEYED vs IDLE) and remote COS status.
-  * Jitter buffer queue depth and packet counters.
+  * Real-time packet counters and jitter buffer metrics.
 * **Interactive Controls:**
   * **Push-to-Talk (Terminal):** Press and **hold** `[SPACE]` or `[P]` to transmit. When you release, it automatically unkeys!
   * `[T]`: Trigger 1-second 1 kHz test tone burst (useful for rapid audio path checks).
@@ -102,6 +106,7 @@ usage: audio_app.py [-h] [--room ROOM] [--server SERVER] [--peer PEER]
                     [--endian {big,little}] [--mode {auto,synth,live}]
                     [--tone-freq TONE_FREQ] [--wav-play WAV_PLAY]
                     [--wav-record WAV_RECORD] [--auto-ptt AUTO_PTT]
+                    [--allow-doubling] [--no-roger-beep]
 
 options:
   --room ROOM           Matchmaker Room key (e.g. 1234)
@@ -114,4 +119,6 @@ options:
   --wav-play WAV_PLAY   Path to 16kHz mono WAV file to transmit on PTT
   --wav-record WAV_RECORD Path to record received PCM audio as WAV
   --auto-ptt AUTO_PTT   Automated PTT toggle interval in seconds (0 = disabled)
+  --allow-doubling      Disable Busy Channel Lockout (allow simultaneous transmitting)
+  --no-roger-beep       Disable courtesy tone / roger beep on remote unkey
 ```

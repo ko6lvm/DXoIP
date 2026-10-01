@@ -275,9 +275,9 @@ class TestSimulatorIntegration(unittest.TestCase):
         sim_b.start()
 
         try:
-            # Trigger 200ms tone burst (~10 audio frames @ 50 fps)
-            sim_a.trigger_tone_burst(duration_s=0.25)
-            time.sleep(0.35)
+            # Trigger 500ms tone burst (~25 audio frames @ 50 fps)
+            sim_a.trigger_tone_burst(duration_s=0.5)
+            time.sleep(0.2)
 
             # sim_b should have received audio frames and updated COS / PTT state
             self.assertGreaterEqual(sim_b.rx_audio_frames, 5)
@@ -315,7 +315,7 @@ class TestSimulatorIntegration(unittest.TestCase):
 
         try:
             # Press PTT
-            sim_a.key_ptt()
+            self.assertTrue(sim_a.key_ptt())
             self.assertTrue(sim_a.is_transmitting)
             time.sleep(0.2)
             self.assertTrue(sim_b.last_rx_remote_ptt)
@@ -324,8 +324,60 @@ class TestSimulatorIntegration(unittest.TestCase):
             # Release PTT
             sim_a.unkey_ptt()
             self.assertFalse(sim_a.is_transmitting)
-            time.sleep(0.1)
+            time.sleep(0.15)
             self.assertFalse(sim_b.last_rx_remote_ptt)
+        finally:
+            sim_a.stop()
+            sim_b.stop()
+
+    def test_simplex_busy_channel_lockout(self):
+        """Simplex radio: local PTT must be locked out when channel is busy."""
+        from tools.audio_simulator.audio_app import RoipAudioSimulator
+
+        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
+        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
+        udp_a.connected = True
+        udp_a.running = True
+        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
+        udp_a._rx_thread.start()
+
+        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
+        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
+        udp_b.connected = True
+        udp_b.running = True
+        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
+        udp_b._rx_thread.start()
+
+        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth", busy_channel_lockout=True)
+        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth", busy_channel_lockout=True)
+
+        sim_a.start()
+        sim_b.start()
+
+        try:
+            # Station A keys PTT (channel is clear, so keys successfully)
+            self.assertTrue(sim_a.key_ptt())
+            time.sleep(0.15)
+
+            # Station B detects active channel
+            self.assertTrue(sim_b.is_channel_busy)
+
+            # Station B attempts to key PTT -> Must be LOCKED OUT!
+            keyed = sim_b.key_ptt()
+            self.assertFalse(keyed)
+            self.assertFalse(sim_b.ptt_active)
+
+            # Station A unkeys
+            sim_a.unkey_ptt()
+            time.sleep(0.2)
+
+            # Channel clears -> Station B can now key PTT
+            self.assertTrue(sim_b.key_ptt())
+            self.assertTrue(sim_b.ptt_active)
+            sim_b.unkey_ptt()
         finally:
             sim_a.stop()
             sim_b.stop()
