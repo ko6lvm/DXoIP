@@ -37,13 +37,19 @@ from tools.audio_simulator.jitter_buffer import JitterBuffer
 
 
 class TerminalController:
-    """Handles non-blocking single-key or line input across platforms."""
+    """Handles non-blocking single-key input across Linux, macOS, and Windows."""
 
     def __init__(self):
+        self.is_windows = (os.name == "nt")
         self.is_tty = sys.stdin.isatty()
+        self.interactive = self.is_tty
         self.old_settings = None
 
     def __enter__(self):
+        if self.is_windows:
+            self.interactive = self.is_tty
+            return self
+
         if self.is_tty:
             try:
                 import termios
@@ -52,11 +58,11 @@ class TerminalController:
                 self.old_settings = termios.tcgetattr(sys.stdin)
                 tty.setcbreak(sys.stdin.fileno())
             except Exception:
-                self.is_tty = False
+                self.interactive = False
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.is_tty and self.old_settings:
+        if not self.is_windows and self.is_tty and self.old_settings:
             try:
                 import termios
 
@@ -66,6 +72,26 @@ class TerminalController:
 
     def get_key(self, timeout: float = 0.05) -> str:
         """Returns a single character or line if available, or None."""
+        if self.is_windows:
+            try:
+                import msvcrt
+
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    if msvcrt.kbhit():
+                        ch = msvcrt.getwch()
+                        # If extended key prefix (\x00 or \xe0), consume the next scan code
+                        if ch in ("\x00", "\xe0"):
+                            if msvcrt.kbhit():
+                                msvcrt.getwch()
+                            return None
+                        return ch
+                    time.sleep(0.005)
+                return None
+            except Exception:
+                return None
+
+        # POSIX (Linux, macOS)
         try:
             r, _, _ = select.select([sys.stdin], [], [], timeout)
             if not r:
@@ -461,13 +487,24 @@ def main():
 
         threading.Thread(target=auto_ptt_worker, daemon=True, name="AutoPTT").start()
 
+    if os.name == "nt":
+        # Enable ANSI escape sequences on Windows console/PowerShell
+        try:
+            os.system("")
+        except Exception:
+            pass
+
     # 4. Interactive Loop (Push-to-Talk: Hold SPACE/P to talk, release to unkey)
     PTT_HOLD_TIMEOUT = args.ptt_hold_timeout
     last_ptt_press_time = 0.0
 
     try:
         with TerminalController() as term:
-            last_dashboard_update = 0.0
+            # Immediate initial dashboard display
+            if term.interactive:
+                print_dashboard(sim)
+
+            last_dashboard_update = time.time()
             while sim.running and udp_mgr.connected:
                 now = time.time()
 
@@ -477,7 +514,7 @@ def main():
 
                 # Update dashboard ~5 times/second
                 if now - last_dashboard_update >= 0.2:
-                    if term.is_tty:
+                    if term.interactive:
                         print_dashboard(sim)
                     last_dashboard_update = now
 
