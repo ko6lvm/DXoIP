@@ -178,48 +178,6 @@ def generate_morse_frames(
     return _samples_to_frames(all_samples)
 
 
-# DTMF Dual-Tone Frequencies (ITU-T Q.23 standard)
-DTMF_FREQUENCIES = {
-    "1": (697, 1209), "2": (697, 1336), "3": (697, 1477), "A": (697, 1633),
-    "4": (770, 1209), "5": (770, 1336), "6": (770, 1477), "B": (770, 1633),
-    "7": (852, 1209), "8": (852, 1336), "9": (852, 1477), "C": (852, 1633),
-    "*": (941, 1209), "0": (941, 1336), "#": (941, 1477), "D": (941, 1633),
-}
-
-
-def generate_dtmf_frames(
-    digit: str, duration_ms: int = 100, gap_ms: int = 40, amplitude: int = 12000
-) -> list:
-    """
-    Generates a list of 20ms PCM audio frames containing standard ITU-T DTMF dual tones.
-    Used for Part 97 auxiliary station telecommand and control signaling.
-    """
-    digit_char = str(digit).upper()
-    if digit_char not in DTMF_FREQUENCIES:
-        return []
-
-    f1, f2 = DTMF_FREQUENCIES[digit_char]
-    total_samples = int(SAMPLE_RATE * (duration_ms / 1000.0))
-    edge_samples = min(int(SAMPLE_RATE * 0.005), total_samples // 2)
-
-    samples = []
-    for i in range(total_samples):
-        if edge_samples > 0 and i < edge_samples:
-            env = 0.5 * (1.0 - math.cos(math.pi * i / edge_samples))
-        elif edge_samples > 0 and i >= (total_samples - edge_samples):
-            env = 0.5 * (1.0 + math.cos(math.pi * (i - (total_samples - edge_samples)) / edge_samples))
-        else:
-            env = 1.0
-
-        t = i / SAMPLE_RATE
-        val = int(0.5 * amplitude * env * (math.sin(2.0 * math.pi * f1 * t) + math.sin(2.0 * math.pi * f2 * t)))
-        samples.append(max(-32768, min(32767, val)))
-
-    if gap_ms > 0:
-        samples.extend([0] * int(SAMPLE_RATE * (gap_ms / 1000.0)))
-
-    return _samples_to_frames(samples)
-
 
 def generate_courtesy_tone_frames(style: str = "chime", amplitude: int = 12000) -> list:
     """

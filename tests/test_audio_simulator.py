@@ -32,9 +32,7 @@ from tools.audio_simulator.audio_backend import (
     format_vu_meter,
     generate_tone_frames,
     generate_morse_frames,
-    generate_dtmf_frames,
     generate_courtesy_tone_frames,
-    DTMF_FREQUENCIES,
     BYTES_PER_FRAME,
     SAMPLES_PER_FRAME,
     SAMPLE_RATE,
@@ -430,6 +428,98 @@ class TestSimulatorIntegration(unittest.TestCase):
             sim_a.stop()
             sim_b.stop()
 
+    def test_part97_cw_id_squelch_closure_with_mic_backend(self):
+        """Verifies that CW ID finishes and squelch closes cleanly even with an active microphone capture queue."""
+        import queue
+        from tools.audio_simulator.audio_app import RoipAudioSimulator
+        from tools.audio_simulator.audio_backend import AudioBackend, BYTES_PER_FRAME
+
+        class MockLiveCaptureBackend(AudioBackend):
+            def __init__(self):
+                self._in_queue = queue.Queue(maxsize=3)
+                self.running = True
+                self.th = threading.Thread(target=self._capture_worker, daemon=True)
+            def start(self):
+                self.th.start()
+            def stop(self):
+                self.running = False
+            def flush_input(self):
+                while not self._in_queue.empty():
+                    try:
+                        self._in_queue.get_nowait()
+                    except Exception:
+                        break
+            def has_buffered_input(self):
+                return not self._in_queue.empty()
+            def read_frame(self):
+                try:
+                    return self._in_queue.get(timeout=0.03)
+                except Exception:
+                    return b"\x00" * BYTES_PER_FRAME
+            def write_frame(self, data):
+                pass
+            def _capture_worker(self):
+                while self.running:
+                    time.sleep(0.02)
+                    try:
+                        self._in_queue.put_nowait(b"\x01\x00" * 320)
+                    except queue.Full:
+                        try:
+                            self._in_queue.get_nowait()
+                            self._in_queue.put_nowait(b"\x01\x00" * 320)
+                        except Exception:
+                            pass
+
+        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
+        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
+        udp_a.connected = True
+        udp_a.running = True
+        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
+        udp_a._rx_thread.start()
+
+        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
+        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
+        udp_b.connected = True
+        udp_b.running = True
+        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
+        udp_b._rx_thread.start()
+
+        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth", callsign="E", cw_wpm=60)
+        sim_a.audio_backend = MockLiveCaptureBackend()
+
+        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth", callsign="W", cw_wpm=60)
+
+        sim_a.start()
+        sim_b.start()
+
+        try:
+            self.assertTrue(sim_a.trigger_cw_id(force=True))
+            # Wait for CW ID to complete (at 60 WPM, callsign 'E' is ~4 frames / 80ms)
+            timeout = time.time() + 2.0
+            while sim_a.is_cw_iding and time.time() < timeout:
+                time.sleep(0.05)
+
+            self.assertFalse(sim_a.is_cw_iding)
+            # Allow time for unkey heartbeat, hang-time (100ms), and jitter buffer squelch timeout (150ms)
+            time.sleep(0.35)
+
+            # Squelch must be closed on Station B and TX must be inactive on Station A
+            self.assertFalse(sim_a.is_transmitting)
+            self.assertFalse(sim_b.is_channel_busy)
+            self.assertFalse(sim_b.last_rx_remote_ptt)
+            self.assertFalse(sim_b.jitter_buffer.is_receiving)
+
+            # Ensure Station A is not continuously transmitting mic audio
+            frames_before = sim_a.tx_audio_frames
+            time.sleep(0.2)
+            self.assertEqual(sim_a.tx_audio_frames, frames_before)
+        finally:
+            sim_a.stop()
+            sim_b.stop()
+
     def test_part97_timeout_timer_enforcement(self):
         """TOT cut-off: continuous PTT exceeding limit forcibly cuts off TX and locks out."""
         from tools.audio_simulator.audio_app import RoipAudioSimulator
@@ -486,45 +576,6 @@ class TestSimulatorIntegration(unittest.TestCase):
             sim_a.stop()
             sim_b.stop()
 
-    def test_part97_dtmf_telecommand(self):
-        """DTMF digit triggers transmission of dual-tone frames and peer receives audio."""
-        from tools.audio_simulator.audio_app import RoipAudioSimulator
-
-        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
-        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
-
-        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
-        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
-        udp_a.connected = True
-        udp_a.running = True
-        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
-        udp_a._rx_thread.start()
-
-        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
-        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
-        udp_b.connected = True
-        udp_b.running = True
-        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
-        udp_b._rx_thread.start()
-
-        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth")
-        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth")
-
-        sim_a.start()
-        sim_b.start()
-
-        try:
-            self.assertTrue(sim_a.trigger_dtmf("4"))
-            self.assertEqual(sim_a.current_dtmf_digit, "4")
-            self.assertTrue(sim_a.is_transmitting)
-
-            time.sleep(0.15)
-            self.assertGreater(sim_b.rx_audio_frames, 1)
-            self.assertTrue(sim_b.last_rx_remote_ptt)
-        finally:
-            sim_a.stop()
-            sim_b.stop()
-
     def test_part97_controller_lines(self):
         """Verify ptt_line and cos_line reflect hardware states accurately."""
         from tools.audio_simulator.audio_app import RoipAudioSimulator
@@ -576,7 +627,7 @@ class TestSimulatorIntegration(unittest.TestCase):
 
 
 class TestPart97Generators(unittest.TestCase):
-    """Verifies FCC Part 97 CW Morse ID, DTMF telecommand, and courtesy tone synthesis."""
+    """Verifies FCC Part 97 CW Morse ID and courtesy tone synthesis."""
 
     def test_morse_generation_ko6lvm(self):
         """KO6LVM at 25 WPM CW Morse generation."""
@@ -598,19 +649,6 @@ class TestPart97Generators(unittest.TestCase):
         frames_15wpm = generate_morse_frames("KO6LVM", wpm=15)
         frames_25wpm = generate_morse_frames("KO6LVM", wpm=25)
         self.assertGreater(len(frames_15wpm), len(frames_25wpm))
-
-    def test_dtmf_generation_all_digits(self):
-        """All 16 standard ITU-T DTMF digits (0-9, *, #, A-D) generate valid frames."""
-        for digit in DTMF_FREQUENCIES:
-            frames = generate_dtmf_frames(digit, duration_ms=100, gap_ms=40)
-            self.assertGreater(len(frames), 0)
-            for frame in frames:
-                self.assertEqual(len(frame), BYTES_PER_FRAME)
-            max_rms = max(calculate_rms_db(f) for f in frames)
-            self.assertGreater(max_rms, -20.0)
-
-        # Invalid key returns empty list
-        self.assertEqual(generate_dtmf_frames("Z"), [])
 
     def test_courtesy_tones(self):
         """Verifies courtesy tone and alert styles."""

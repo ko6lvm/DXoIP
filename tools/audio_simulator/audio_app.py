@@ -30,7 +30,6 @@ from tools.audio_simulator.audio_backend import (
     format_vu_meter,
     generate_tone_frames,
     generate_morse_frames,
-    generate_dtmf_frames,
     generate_courtesy_tone_frames,
     BYTES_PER_FRAME,
     FRAME_DURATION_MS,
@@ -149,7 +148,7 @@ class RoipAudioSimulator:
     Part 97 Auxiliary Simplex Station Controller & Audio Simulator.
     Manages the 50 Hz audio transmission loop, jitter-buffered reception,
     continuous PTT/COS signaling, 25 WPM CW station IDer, FCC legal ID timer,
-    Time-Out Timer (TOT), DTMF telecommand, and hardware line telemetry.
+    Time-Out Timer (TOT), and hardware line telemetry.
     """
 
     def __init__(
@@ -208,11 +207,7 @@ class RoipAudioSimulator:
         self.hang_time_s = float(hang_time_s)
         self.squelch_hang_until = 0.0
 
-        # DTMF Telecommand Signaling
-        self._dtmf_tx_frames = collections.deque()
-        self.current_dtmf_digit = None
-
-        # Sidetone queue for local playback during CW ID and DTMF transmission
+        # Sidetone queue for local playback during CW ID transmission
         self._sidetone_frames = collections.deque()
 
         # Simplex State flags
@@ -241,18 +236,17 @@ class RoipAudioSimulator:
     def is_channel_busy(self) -> bool:
         """Returns True if the simplex channel is occupied (remote station transmitting or squelch hang)."""
         now = time.time()
-        return self.jitter_buffer.is_receiving or self.last_rx_remote_ptt or (now < self.squelch_hang_until)
+        return self.jitter_buffer.is_receiving or (now < self.squelch_hang_until)
 
     @property
     def is_transmitting(self) -> bool:
-        """Returns True if local transmitter PTT is asserted (Voice, Burst, CW ID, or DTMF)."""
+        """Returns True if local transmitter PTT is asserted (Voice, Burst, or CW ID)."""
         if self.tot_cutoff:
             return False
         return (
             self.ptt_active
             or (time.time() < self.burst_active_until)
             or bool(self._cw_tx_frames)
-            or bool(self._dtmf_tx_frames)
         )
 
     @property
@@ -329,7 +323,7 @@ class RoipAudioSimulator:
     def _tx_loop(self):
         """
         Precise 50 Hz (20ms) transmission loop.
-        Transmits 648B RoIP Data frames when PTT / CW ID / DTMF is active,
+        Transmits 648B RoIP Data frames when PTT / CW ID is active,
         enforces Time-Out Timer (TOT), handles 10-minute auto ID, and
         transmits 8B Heartbeats when idle to maintain NAT pinholes.
         """
@@ -337,6 +331,8 @@ class RoipAudioSimulator:
         next_deadline = time.time()
         last_heartbeat_time = 0.0
         was_transmitting = False
+        was_voice_transmitting = False
+        drain_voice_frames = 0
 
         while self.running and self.udp_manager.connected:
             now = time.time()
@@ -350,9 +346,12 @@ class RoipAudioSimulator:
                     self.ptt_start_time = 0.0
                     for f in generate_courtesy_tone_frames("boop"):
                         self._alert_frames.append(f)
-                    self.roip.send_heartbeat(ptt=False, cos=self.is_channel_busy)
-                    self.tx_heartbeats += 1
+                    for _ in range(2):
+                        self.roip.send_heartbeat(ptt=False, cos=self.is_channel_busy)
+                    self.tx_heartbeats += 2
                     was_transmitting = False
+                    was_voice_transmitting = False
+                    self.audio_backend.flush_input()
 
             # 2. Check Automated 10-Minute FCC Legal ID Timer
             if (
@@ -363,7 +362,7 @@ class RoipAudioSimulator:
             ):
                 self.trigger_cw_id(force=False)
 
-            # 3. Transmission Priority: CW ID -> DTMF -> Voice PTT / Burst
+            # 3. Transmission Priority: CW ID -> Voice PTT / Burst
             if self._cw_tx_frames:
                 pcm_data = self._cw_tx_frames.popleft()
                 self.last_tx_db = calculate_rms_db(pcm_data)
@@ -371,18 +370,10 @@ class RoipAudioSimulator:
                 self.tx_audio_frames += 1
                 self._sidetone_frames.append(pcm_data)
                 was_transmitting = True
+                was_voice_transmitting = False
                 if not self._cw_tx_frames:
                     self.is_cw_iding = False
-
-            elif self._dtmf_tx_frames:
-                pcm_data = self._dtmf_tx_frames.popleft()
-                self.last_tx_db = calculate_rms_db(pcm_data)
-                self.roip.send_data(payload=pcm_data, ptt=True, cos=False)
-                self.tx_audio_frames += 1
-                self._sidetone_frames.append(pcm_data)
-                was_transmitting = True
-                if not self._dtmf_tx_frames:
-                    self.current_dtmf_digit = None
+                    self.audio_backend.flush_input()
 
             elif self.is_transmitting:
                 # Capture 320 samples (640 bytes) of PCM audio
@@ -393,21 +384,30 @@ class RoipAudioSimulator:
                 self.roip.send_data(payload=pcm_data, ptt=True, cos=False)
                 self.tx_audio_frames += 1
                 was_transmitting = True
+                was_voice_transmitting = True
+                drain_voice_frames = 2
 
-            elif was_transmitting and self.audio_backend.has_buffered_input():
-                # Drain trailing audio frames captured right before unkeying
+            elif was_voice_transmitting and drain_voice_frames > 0 and self.audio_backend.has_buffered_input():
+                # Drain trailing audio frames captured right before unkeying (max 2 frames)
                 pcm_data = self.audio_backend.read_frame()
                 self.last_tx_db = calculate_rms_db(pcm_data)
                 self.roip.send_data(payload=pcm_data, ptt=True, cos=False)
                 self.tx_audio_frames += 1
+                drain_voice_frames -= 1
+                if drain_voice_frames == 0 or not self.audio_backend.has_buffered_input():
+                    was_voice_transmitting = False
+                    self.audio_backend.flush_input()
 
             else:
+                was_voice_transmitting = False
                 if was_transmitting:
                     # Trailing speech frames fully drained: send clean unkey heartbeat
-                    self.roip.send_heartbeat(ptt=False, cos=self.is_channel_busy)
-                    self.tx_heartbeats += 1
+                    for _ in range(2):
+                        self.roip.send_heartbeat(ptt=False, cos=self.is_channel_busy)
+                    self.tx_heartbeats += 2
                     last_heartbeat_time = now
                     was_transmitting = False
+                    self.audio_backend.flush_input()
                 elif now - last_heartbeat_time >= 1.0:
                     # Idle: send 8-byte heartbeat at ~1 Hz keepalive
                     self.roip.send_heartbeat(ptt=False, cos=self.is_channel_busy)
@@ -427,14 +427,23 @@ class RoipAudioSimulator:
         """
         Pulls decoded PCM frames at 50 Hz and streams to output.
         Enforces simplex rule: local transmission mutes receiver playback,
-        while routing local sidetone for CW ID and DTMF transmission.
+        while routing local sidetone for CW ID transmission.
         """
         frame_interval_s = FRAME_DURATION_MS / 1000.0
         next_deadline = time.time()
 
         while self.running and self.udp_manager.connected:
+            # Check for remote carrier drop if jitter buffer timed out without an explicit unkey heartbeat
+            if self.last_rx_remote_ptt and not self.jitter_buffer.is_receiving:
+                self.last_rx_remote_ptt = False
+                now = time.time()
+                self.squelch_hang_until = now + self.hang_time_s
+                if self.roger_beep:
+                    for f in generate_courtesy_tone_frames(style=self.courtesy_tone_style):
+                        self._alert_frames.append(f)
+
             if self._sidetone_frames:
-                # Local sidetone for CW ID or DTMF transmission
+                # Local sidetone for CW ID transmission
                 sidetone_frame = self._sidetone_frames.popleft()
                 self.audio_backend.write_frame(sidetone_frame)
                 self.last_rx_db = calculate_rms_db(sidetone_frame)
@@ -481,6 +490,7 @@ class RoipAudioSimulator:
             self.lockout_notice_until = time.time() + 1.2
             return False
 
+        self.audio_backend.flush_input()
         frames = generate_morse_frames(
             text=self.callsign,
             wpm=self.cw_wpm,
@@ -491,22 +501,6 @@ class RoipAudioSimulator:
             self._cw_tx_frames.append(f)
         self.is_cw_iding = True
         self.last_id_time = time.time()
-        return True
-
-    def trigger_dtmf(self, digit: str) -> bool:
-        """Transmits an ITU-T standard DTMF dual-tone burst for telecommand signaling."""
-        if self.busy_channel_lockout and self.is_channel_busy:
-            self.lockout_notice_until = time.time() + 1.2
-            return False
-
-        frames = generate_dtmf_frames(digit=digit, duration_ms=100, gap_ms=40)
-        if not frames:
-            return False
-
-        self.current_dtmf_digit = str(digit).upper()
-        self._dtmf_tx_frames.clear()
-        for f in frames:
-            self._dtmf_tx_frames.append(f)
         return True
 
     def key_ptt(self) -> bool:
@@ -547,7 +541,7 @@ class RoipAudioSimulator:
             return self.key_ptt()
 
 
-def print_dashboard(sim: RoipAudioSimulator, dtmf_entry: bool = False):
+def print_dashboard(sim: RoipAudioSimulator):
     """Renders an authentic FCC Part 97 Auxiliary Simplex Station Controller dashboard."""
     now = time.time()
 
@@ -558,9 +552,6 @@ def print_dashboard(sim: RoipAudioSimulator, dtmf_entry: bool = False):
     elif sim.is_cw_iding:
         operating_state = "CW ID BEACON"
         channel_status = f"TRANSMITTING ID: {sim.callsign} @ {sim.cw_wpm} WPM"
-    elif sim.current_dtmf_digit:
-        operating_state = "DTMF TRANSMIT"
-        channel_status = f"TRANSMITTING DTMF DIGIT: {sim.current_dtmf_digit}"
     elif sim.is_transmitting:
         operating_state = "TX (TRANSMITTING)"
         channel_status = "TRANSMIT ACTIVE (PTT Asserted / Local RX Muted)"
@@ -580,8 +571,6 @@ def print_dashboard(sim: RoipAudioSimulator, dtmf_entry: bool = False):
         ptt_line_str = "ON (VOICE)"
     elif sim.is_cw_iding:
         ptt_line_str = "ON (CW ID)"
-    elif sim._dtmf_tx_frames:
-        ptt_line_str = "ON (DTMF)"
     elif time.time() < sim.burst_active_until:
         ptt_line_str = "ON (TONE)"
     elif sim.tot_cutoff:
@@ -630,8 +619,6 @@ def print_dashboard(sim: RoipAudioSimulator, dtmf_entry: bool = False):
     backend_name = sim.audio_backend.__class__.__name__
     rtt_val = f"{sim.udp_manager.last_rtt_ms:.1f} ms" if sim.udp_manager.last_rtt_ms > 0 else "measuring"
 
-    dtmf_indicator = " [DTMF ENTRY: PRESS 0-9, *, #, A-D]" if dtmf_entry else ""
-
     lines = [
         "\033[H",  # Move cursor to top-left without wiping the display (eliminates Windows flicker)
         "======================================================================\033[K\n",
@@ -642,7 +629,7 @@ def print_dashboard(sim: RoipAudioSimulator, dtmf_entry: bool = False):
         f" Peer Endpoint   : {sim.udp_manager.peer_addr[0]}:{sim.udp_manager.peer_addr[1]:<14} Link RTT    : {rtt_val:<18}\033[K\n",
         "----------------------------------------------------------------------\033[K\n",
         f" Controller Lines: PTT [ {ptt_line_str:<10} ]    COS [ {cos_line_str:<16} ]\033[K\n",
-        f" Operating State : [ {operating_state:<20} ]{dtmf_indicator}\033[K\n",
+        f" Operating State : [ {operating_state:<20} ]\033[K\n",
         f" Channel Status  : {channel_status}\033[K\n",
         f" Channel Rules   : BCLO: [{bclo_mode}] | Courtesy Tone: [{courtesy_mode}]\033[K\n",
         "----------------------------------------------------------------------\033[K\n",
@@ -652,7 +639,7 @@ def print_dashboard(sim: RoipAudioSimulator, dtmf_entry: bool = False):
         f" Tx Audio Frames : {sim.tx_audio_frames:<6} (Heartbeats: {sim.tx_heartbeats:<4}) | Rx Frames: {sim.rx_audio_frames:<6} (Heartbeats: {sim.rx_heartbeats:<4})\033[K\n",
         f" Jitter Buffer   : {sim.jitter_buffer.queued_frames} frms ({sim.jitter_buffer.underrun_count} underruns, {sim.jitter_buffer.late_drop_count} drops) | Audio: {backend_name}\033[K\n",
         "======================================================================\033[K\n",
-        " Controls: [HOLD SPACE/P] Push-to-Talk | [I] CW ID | [D] DTMF Tone\033[K\n",
+        " Controls: [HOLD SPACE/P] Push-to-Talk | [I] CW ID\033[K\n",
         "           [T] 1s Tone Burst | [H] Heartbeat | [Q] Disconnect & Shutdown\033[K\n",
         "\033[J",  # Clear anything remaining below dashboard
     ]
@@ -800,7 +787,6 @@ def main():
         # 4. Interactive Loop (Push-to-Talk: Hold SPACE/P to talk, release to unkey)
         PTT_HOLD_TIMEOUT = args.ptt_hold_timeout
         last_ptt_press_time = 0.0
-        dtmf_entry_mode = False
 
         try:
             with TerminalController() as term:
@@ -808,7 +794,7 @@ def main():
                 if term.interactive:
                     sys.stdout.write("\033[2J\033[H")
                     sys.stdout.flush()
-                    print_dashboard(sim, dtmf_entry=False)
+                    print_dashboard(sim)
 
                 last_dashboard_update = time.time()
                 while sim.running and udp_mgr.connected:
@@ -821,7 +807,7 @@ def main():
                     # Update dashboard ~5 times/second
                     if now - last_dashboard_update >= 0.2:
                         if term.interactive:
-                            print_dashboard(sim, dtmf_entry=dtmf_entry_mode)
+                            print_dashboard(sim)
                         last_dashboard_update = now
 
                     key = term.get_key(timeout=0.03)
@@ -829,14 +815,6 @@ def main():
                         continue
 
                     key_lower = key.lower()
-
-                    if dtmf_entry_mode:
-                        if key_lower in "0123456789*#abcd":
-                            sim.trigger_dtmf(key_lower.upper())
-                        dtmf_entry_mode = False
-                        if term.interactive:
-                            print_dashboard(sim, dtmf_entry=False)
-                        continue
 
                     if key_lower in ("q", "\x03"):  # 'q' or Ctrl-C
                         break
@@ -846,10 +824,6 @@ def main():
                             sim.key_ptt()
                     elif key_lower == "i":
                         sim.trigger_cw_id(force=False)
-                    elif key_lower == "d":
-                        dtmf_entry_mode = True
-                        if term.interactive:
-                            print_dashboard(sim, dtmf_entry=True)
                     elif key_lower == "t":
                         sim.trigger_tone_burst(duration_s=1.0)
                     elif key_lower == "h":

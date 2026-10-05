@@ -1,6 +1,6 @@
 # DXoIP Part 97 Auxiliary Simplex Station Controller & Audio Simulator
 
-An authentic **FCC Part 97 Auxiliary Simplex Station Controller** and test application for real-time **16 kHz 16-bit linear PCM RoIP audio streaming**, **continuous PTT/COS signaling**, **25 WPM CW station identification**, **Time-Out Timer (TOT) safety enforcement**, and **DTMF telecommand** over peer-to-peer UDP connections.
+An authentic **FCC Part 97 Auxiliary Simplex Station Controller** and test application for real-time **16 kHz 16-bit linear PCM RoIP audio streaming**, **continuous PTT/COS signaling**, **25 WPM CW station identification**, and **Time-Out Timer (TOT) safety enforcement** over peer-to-peer UDP connections.
 
 > [!NOTE]
 > **Clean Isolation:** This station controller is strictly isolated in `tools/audio_simulator/`. The core DXoIP codebase (`roip_udp.py`, `udp_manager.py`) and minimal headless entry point (`peer.py`) remain 100% zero-dependency and compatible with MicroPython on the Raspberry Pi Pico 2 W.
@@ -23,18 +23,15 @@ An authentic **FCC Part 97 Auxiliary Simplex Station Controller** and test appli
 
 * **Radio Interface & Controller Lines:**
   * Simulates direct interfacing to the two-way radio hardware:
-    * **`PTT Line`:** Reflects transmitter hardware state (`ON (VOICE)`, `ON (CW ID)`, `ON (DTMF)`, `ON (TONE)`, `CUTOFF`, `OFF`).
+    * **`PTT Line`:** Reflects transmitter hardware state (`ON (VOICE)`, `ON (CW ID)`, `ON (TONE)`, `CUTOFF`, `OFF`).
     * **`COS Line`:** Reflects receiver Carrier Operated Squelch state (`OPEN (CARRIER DETECT)`, `CLOSED (SQUELCHED)`, `MUTED (TX)`).
   * **Simplex Half-Duplex Rule:** Transmitting RF squelches local receiver playback to eliminate acoustic feedback.
   * **Busy Channel Lockout (BCLO):** Inhibits local transmission while remote carrier (`COS`) is detected to prevent doubling on the simplex frequency (can be bypassed with `--allow-doubling`).
   * **Squelch Tail & Courtesy Chime:** 100ms carrier hang-time delay followed by a dual-tone auxiliary link courtesy chime (880 Hz / 1046 Hz) when the remote station drops carrier.
 
-* **DTMF Telecommand Generator (§97.201):**
-  * Press `[D]` followed by any standard ITU-T DTMF key (`0-9`, `*`, `#`, `A-D`) to transmit dual-frequency telecommand tones over the link with audible local sidetone.
-
 * **Dual-Mode Audio Engine:**
   * **Live Hardware Audio (`mode=live`):** Streams from your physical microphone and plays out to your speakers using `sounddevice` (when hardware and `libportaudio2` are available).
-  * **Synthetic Audio / File Engine (`mode=synth`):** Built-in zero-dependency generator producing 1 kHz sine wave test tones, CW Morse code, DTMF dual tones, courtesy chimes, or playing from 16 kHz WAV files. Can also record received audio to `.wav`.
+  * **Synthetic Audio / File Engine (`mode=synth`):** Built-in zero-dependency generator producing 1 kHz sine wave test tones, CW Morse code, courtesy chimes, or playing from 16 kHz WAV files. Can also record received audio to `.wav`.
 
 * **Tactical Terminal Dashboard:**
   * Full Part 97 Auxiliary Link console showing station ID, legal ID timer, TOT status bar, hardware controller lines, operating state, dBFS VU meters, and network telemetry (RTT, jitter queue, packet stats).
@@ -43,7 +40,7 @@ An authentic **FCC Part 97 Auxiliary Simplex Station Controller** and test appli
 
 ## Setup & Virtual Environment
 
-You can run this station controller using standard Python (zero external dependencies required for synthetic audio / CW / DTMF) or install `sounddevice` for live hardware audio:
+You can run this station controller using standard Python (zero external dependencies required for synthetic audio / CW) or install `sounddevice` for live hardware audio:
 
 ### 1. Create and Activate Virtual Environment
 ```bash
@@ -82,7 +79,6 @@ Once connected:
 * Press and hold `[SPACE]` or `[P]` in Terminal 1: Transmits audio with PTT active; observe Terminal 2 squelch open (`COS Line: CARRIER DETECT`).
 * Release `[SPACE]`: Terminal 1 unkeys; Terminal 2 plays the dual-tone courtesy chime.
 * Press `[I]` in Terminal 1: Sends 25 WPM CW Morse ID for `KO6LVM`; hear sidetone in Terminal 1 and Morse code received in Terminal 2.
-* Press `[D]` then `9` in Terminal 1: Sends DTMF tone `9`.
 
 ---
 
@@ -106,7 +102,6 @@ python3 tools/audio_simulator/audio_app.py --room 5432 --callsign N0CALL
 | :--- | :--- |
 | `[HOLD SPACE]` / `[P]` | **Push-to-Talk (PTT):** Transmit voice or test audio. Release to unkey. |
 | `[I]` | **Station CW ID:** Transmit station identification (`KO6LVM`) in 25 WPM Morse code. |
-| `[D]` | **DTMF Telecommand:** Prompts for digit (`0-9`, `*`, `#`, `A-D`) and transmits dual tone. |
 | `[T]` | **Tone Burst:** Transmit 1-second 1 kHz sine wave test tone. |
 | `[H]` | **Heartbeat:** Transmit 8-byte RoIP keepalive packet. |
 | `[Q]` / `[Ctrl+C]` | **Power Down:** Disconnect and cleanly shut down the station. |
