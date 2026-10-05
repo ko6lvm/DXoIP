@@ -18,12 +18,20 @@ ATTR_MAPPED_ADDRESS = 0x0001
 ATTR_XOR_MAPPED_ADDRESS = 0x0020
 
 
+_STUN_HDR_STRUCT = struct.Struct("!HHI12s")
+_STUN_ATTR_HDR = struct.Struct("!HH")
+_STUN_MAPPED_V4 = struct.Struct("!BBH4s")
+
+
 def generate_transaction_id():
     """Generates 12 random bytes for the STUN transaction ID."""
     try:
         return os.urandom(12)
     except (AttributeError, NotImplementedError):
-        # MicroPython fallback if os.urandom is unavailable
+        pass
+    try:
+        return random.getrandbits(96).to_bytes(12, "big")
+    except (AttributeError, OverflowError):
         return bytes([random.randint(0, 255) for _ in range(12)])
 
 
@@ -35,19 +43,19 @@ def build_binding_request(transaction_id):
     Magic Cookie: 0x2112A442
     Transaction ID: 12 bytes
     """
-    header = struct.pack("!HHI12s", STUN_BINDING_REQUEST, 0, STUN_MAGIC_COOKIE, transaction_id)
-    return header
+    return _STUN_HDR_STRUCT.pack(STUN_BINDING_REQUEST, 0, STUN_MAGIC_COOKIE, transaction_id)
 
 
 def parse_binding_response(data, transaction_id):
     """
     Parses a STUN Binding Response and extracts (ip, port).
     Supports both XOR-MAPPED-ADDRESS (RFC 5389) and MAPPED-ADDRESS (RFC 3489).
+    Uses unpack_from to eliminate buffer slicing.
     """
     if len(data) < 20:
         raise ValueError("Response too short to be a valid STUN message")
 
-    msg_type, msg_len, magic_cookie, resp_tx_id = struct.unpack("!HHI12s", data[:20])
+    msg_type, msg_len, magic_cookie, resp_tx_id = _STUN_HDR_STRUCT.unpack_from(data, 0)
 
     if msg_type != STUN_BINDING_RESPONSE:
         raise ValueError(f"Expected Binding Response (0x0101), got 0x{msg_type:04x}")
@@ -60,28 +68,28 @@ def parse_binding_response(data, transaction_id):
 
     offset = 20
     end = 20 + msg_len
+    data_len = len(data)
 
-    while offset + 4 <= end and offset + 4 <= len(data):
-        attr_type, attr_len = struct.unpack("!HH", data[offset:offset + 4])
-        attr_data = data[offset + 4: offset + 4 + attr_len]
-        # Attributes are padded to multiple of 4 bytes
-        offset += 4 + ((attr_len + 3) & ~3)
+    while offset + 4 <= end and offset + 4 <= data_len:
+        attr_type, attr_len = _STUN_ATTR_HDR.unpack_from(data, offset)
+        attr_offset = offset + 4
+        offset = attr_offset + ((attr_len + 3) & ~3)
 
         if attr_type == ATTR_XOR_MAPPED_ADDRESS:
-            if len(attr_data) >= 8:
-                _, family, xor_port = struct.unpack("!BBH", attr_data[:4])
+            if attr_len >= 8 and attr_offset + 8 <= data_len:
+                _, family, xor_port, xor_ip_bytes = _STUN_MAPPED_V4.unpack_from(data, attr_offset)
                 port = xor_port ^ (STUN_MAGIC_COOKIE >> 16)
                 if family == 0x01:  # IPv4
-                    xor_ip = struct.unpack("!I", attr_data[4:8])[0]
+                    xor_ip = struct.unpack("!I", xor_ip_bytes)[0]
                     ip_int = xor_ip ^ STUN_MAGIC_COOKIE
                     ip = socket.inet_ntoa(struct.pack("!I", ip_int))
                     return (ip, port)
 
         elif attr_type == ATTR_MAPPED_ADDRESS:
-            if len(attr_data) >= 8:
-                _, family, port = struct.unpack("!BBH", attr_data[:4])
+            if attr_len >= 8 and attr_offset + 8 <= data_len:
+                _, family, port, ip_bytes = _STUN_MAPPED_V4.unpack_from(data, attr_offset)
                 if family == 0x01:  # IPv4
-                    ip = socket.inet_ntoa(attr_data[4:8])
+                    ip = socket.inet_ntoa(ip_bytes)
                     return (ip, port)
 
     raise ValueError("No mapped address attribute found in STUN response")

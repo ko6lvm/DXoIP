@@ -18,24 +18,49 @@ ROIP_DATA_SIZE     = 648   # 8-byte header + 640-byte audio payload
 ROIP_HEARTBEAT_SIZE = 8    # 8-byte header only
 
 
-def get_current_timestamp_us():
-    """
-    Returns 32-bit microsecond clock timestamp (0 to 2^32 - 1).
-    Matches Raspberry Pi Pico time_us_32() behavior.
-    """
-    try:
-        import time as utime
-        if hasattr(utime, "ticks_us"):
-            return utime.ticks_us() & 0xFFFFFFFF
-    except Exception:
-        pass
-    return int(time.time() * 1_000_000) & 0xFFFFFFFF
+# Precompiled Structs for Network (Big-Endian) and Little-Endian byte orders
+_STRUCT_BE = struct.Struct("!BBHI")
+_STRUCT_LE = struct.Struct("<BBHI")
+
+
+def _get_header_struct(endianness="!"):
+    """Returns cached struct.Struct instance for the specified endianness."""
+    if endianness == "!":
+        return _STRUCT_BE
+    elif endianness == "<":
+        return _STRUCT_LE
+    return struct.Struct(f"{endianness}BBHI")
+
+
+# Cache optimal microsecond timer function at module load time
+try:
+    import time as _utime
+    if hasattr(_utime, "ticks_us"):
+        _ticks_us = _utime.ticks_us
+
+        def get_current_timestamp_us():
+            """Returns 32-bit microsecond clock timestamp via MicroPython ticks_us()."""
+            return _ticks_us() & 0xFFFFFFFF
+    elif hasattr(time, "time_ns"):
+        _time_ns = time.time_ns
+
+        def get_current_timestamp_us():
+            """Returns 32-bit microsecond clock timestamp via CPython time_ns()."""
+            return (_time_ns() // 1000) & 0xFFFFFFFF
+    else:
+        def get_current_timestamp_us():
+            """Returns 32-bit microsecond clock timestamp via time.time()."""
+            return int(time.time() * 1_000_000) & 0xFFFFFFFF
+except Exception:
+    def get_current_timestamp_us():
+        return int(time.time() * 1_000_000) & 0xFFFFFFFF
 
 
 class RoipPacket:
     """
     Represents a decoded RoIP Data or Heartbeat packet.
     """
+    __slots__ = ("magic", "flags", "sequence", "timestamp", "payload")
 
     def __init__(self, flags=0, sequence=0, timestamp=0, payload=b"", magic=ROIP_MAGIC):
         self.magic = magic
@@ -69,28 +94,49 @@ class RoipPacket:
         Serializes packet to bytes.
         endianness: '!' for Network Byte Order (Big-Endian), '<' for Little-Endian.
         """
-        fmt_hdr = f"{endianness}BBHI"
-        hdr = struct.pack(fmt_hdr, self.magic, self.flags, self.sequence, self.timestamp)
+        hdr_struct = _get_header_struct(endianness)
+        hdr = hdr_struct.pack(self.magic, self.flags, self.sequence, self.timestamp)
         if self.payload:
-            # Pad or truncate payload to exactly AUDIO_PAYLOAD_SIZE (640 bytes)
-            if len(self.payload) < AUDIO_PAYLOAD_SIZE:
-                padded = self.payload + (b"\x00" * (AUDIO_PAYLOAD_SIZE - len(self.payload)))
+            payload_len = len(self.payload)
+            if payload_len == AUDIO_PAYLOAD_SIZE:
+                return hdr + self.payload
+            elif payload_len < AUDIO_PAYLOAD_SIZE:
+                return hdr + self.payload + (b"\x00" * (AUDIO_PAYLOAD_SIZE - payload_len))
             else:
-                padded = self.payload[:AUDIO_PAYLOAD_SIZE]
-            return hdr + padded
+                return hdr + self.payload[:AUDIO_PAYLOAD_SIZE]
         return hdr
+
+    def pack_into(self, buffer, offset=0, endianness="!"):
+        """
+        Serializes packet in-place into an existing bytearray or memoryview buffer.
+        Returns total bytes written (8 for Heartbeat, 648 for Data).
+        """
+        hdr_struct = _get_header_struct(endianness)
+        hdr_struct.pack_into(buffer, offset, self.magic, self.flags, self.sequence, self.timestamp)
+        if self.payload:
+            payload_len = len(self.payload)
+            data_offset = offset + HEADER_SIZE
+            if payload_len >= AUDIO_PAYLOAD_SIZE:
+                buffer[data_offset:data_offset + AUDIO_PAYLOAD_SIZE] = self.payload[:AUDIO_PAYLOAD_SIZE]
+            else:
+                buffer[data_offset:data_offset + payload_len] = self.payload
+                buffer[data_offset + payload_len:data_offset + AUDIO_PAYLOAD_SIZE] = b"\x00" * (AUDIO_PAYLOAD_SIZE - payload_len)
+            return ROIP_DATA_SIZE
+        return ROIP_HEARTBEAT_SIZE
 
     @classmethod
     def from_bytes(cls, data: bytes, endianness="!"):
         """
         Deserializes a raw byte buffer into a RoipPacket.
         Validates Magic byte (0x52) and packet size (8 or 648 bytes).
+        Uses struct.unpack_from to eliminate buffer slicing.
         """
-        if len(data) < HEADER_SIZE:
-            raise ValueError(f"Packet too short ({len(data)} bytes, minimum is {HEADER_SIZE})")
+        data_len = len(data)
+        if data_len < HEADER_SIZE:
+            raise ValueError(f"Packet too short ({data_len} bytes, minimum is {HEADER_SIZE})")
 
-        fmt_hdr = f"{endianness}BBHI"
-        magic, flags, sequence, timestamp = struct.unpack(fmt_hdr, data[:HEADER_SIZE])
+        hdr_struct = _get_header_struct(endianness)
+        magic, flags, sequence, timestamp = hdr_struct.unpack_from(data, 0)
 
         if magic != ROIP_MAGIC:
             raise ValueError(f"Invalid Magic byte 0x{magic:02X} (expected 0x{ROIP_MAGIC:02X})")
@@ -98,7 +144,7 @@ class RoipPacket:
         payload = data[HEADER_SIZE:]
         if len(payload) > 0 and len(payload) != AUDIO_PAYLOAD_SIZE:
             raise ValueError(
-                f"Invalid packet size: {len(data)} bytes. "
+                f"Invalid packet size: {data_len} bytes. "
                 f"Expected {ROIP_HEARTBEAT_SIZE}B (Heartbeat) or {ROIP_DATA_SIZE}B (Data)"
             )
 
@@ -129,6 +175,7 @@ class ROIPUDP:
         self.udp_manager = udp_manager
         self.endianness = endianness
         self._seq = 0
+        self._tx_buffer = bytearray(ROIP_DATA_SIZE)
 
         # Event Callbacks
         self.on_data_received = None       # callback(packet: RoipPacket)
@@ -148,6 +195,7 @@ class ROIPUDP:
     def send_data(self, payload: bytes, ptt: bool = False, cos: bool = False, timestamp: int = None):
         """
         Encodes and transmits a 648-byte RoIP Data packet.
+        Uses in-place preallocated buffer serialization to eliminate heap GC allocations.
         Returns the assigned sequence number.
         """
         if self.udp_manager is None:
@@ -157,9 +205,19 @@ class ROIPUDP:
         seq = self.next_sequence()
         ts = get_current_timestamp_us() if timestamp is None else timestamp
 
-        packet = RoipPacket(flags=flags, sequence=seq, timestamp=ts, payload=payload)
-        raw_bytes = packet.to_bytes(endianness=self.endianness)
-        self.udp_manager.send_packet(raw_bytes)
+        hdr_struct = _get_header_struct(self.endianness)
+        hdr_struct.pack_into(self._tx_buffer, 0, ROIP_MAGIC, flags, seq, ts)
+
+        payload_len = len(payload)
+        if payload_len == AUDIO_PAYLOAD_SIZE:
+            self._tx_buffer[HEADER_SIZE:ROIP_DATA_SIZE] = payload
+        elif payload_len < AUDIO_PAYLOAD_SIZE:
+            self._tx_buffer[HEADER_SIZE:HEADER_SIZE + payload_len] = payload
+            self._tx_buffer[HEADER_SIZE + payload_len:ROIP_DATA_SIZE] = b"\x00" * (AUDIO_PAYLOAD_SIZE - payload_len)
+        else:
+            self._tx_buffer[HEADER_SIZE:ROIP_DATA_SIZE] = payload[:AUDIO_PAYLOAD_SIZE]
+
+        self.udp_manager.send_packet(self._tx_buffer)
         return seq
 
     def send_heartbeat(self, ptt: bool = False, cos: bool = False, timestamp: int = None):
@@ -174,8 +232,8 @@ class ROIPUDP:
         seq = self.next_sequence()
         ts = get_current_timestamp_us() if timestamp is None else timestamp
 
-        packet = RoipPacket(flags=flags, sequence=seq, timestamp=ts, payload=b"")
-        raw_bytes = packet.to_bytes(endianness=self.endianness)
+        hdr_struct = _get_header_struct(self.endianness)
+        raw_bytes = hdr_struct.pack(ROIP_MAGIC, flags, seq, ts)
         self.udp_manager.send_packet(raw_bytes)
         return seq
 

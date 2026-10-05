@@ -19,27 +19,32 @@ SAMPLES_PER_FRAME = 320      # 16000 * 0.02 = 320 samples
 BYTES_PER_FRAME = 640        # 320 samples * 2 bytes = 640 bytes
 
 
+_STRUCT_320H = struct.Struct("<320h")
+SILENCE_FRAME = b"\x00" * BYTES_PER_FRAME
+
+
 def calculate_rms_db(pcm_data: bytes) -> float:
     """
     Computes RMS level in dBFS for 16-bit signed PCM data.
     Returns value between -96.0 dBFS and 0.0 dBFS.
     """
-    if not pcm_data or len(pcm_data) < 2:
+    if not pcm_data or len(pcm_data) < 2 or pcm_data == SILENCE_FRAME:
         return -96.0
 
     count = len(pcm_data) // 2
-    # Unpack 16-bit signed integers
-    fmt = f"<{count}h"
     try:
-        samples = struct.unpack(fmt, pcm_data[:count * 2])
+        if count == SAMPLES_PER_FRAME:
+            samples = _STRUCT_320H.unpack_from(pcm_data, 0)
+        else:
+            samples = struct.unpack(f"<{count}h", pcm_data[:count * 2])
     except struct.error:
         return -96.0
 
     sum_squares = sum(s * s for s in samples)
-    mean_square = sum_squares / count
-    if mean_square <= 0:
+    if sum_squares <= 0:
         return -96.0
 
+    mean_square = sum_squares / count
     rms = math.sqrt(mean_square)
     # Full scale peak is 32767, RMS is 32767 / sqrt(2) = 23170.4
     db = 20 * math.log10(rms / 32767.0)
@@ -71,14 +76,177 @@ def generate_tone_frames(freq: float = 1200.0, duration_ms: int = 80, amplitude:
         val = int(amplitude * math.sin(2.0 * math.pi * freq * t))
         samples.append(max(-32768, min(32767, val)))
         if len(samples) == SAMPLES_PER_FRAME:
-            frames.append(struct.pack(f"<{SAMPLES_PER_FRAME}h", *samples))
+            frames.append(_STRUCT_320H.pack(*samples))
             samples = []
 
     if samples:
         samples += [0] * (SAMPLES_PER_FRAME - len(samples))
-        frames.append(struct.pack(f"<{SAMPLES_PER_FRAME}h", *samples))
+        frames.append(_STRUCT_320H.pack(*samples))
 
     return frames
+
+
+# International Morse Code mapping for Part 97 station identification
+MORSE_CODE_DICT = {
+    "A": ".-", "B": "-...", "C": "-.-.", "D": "-..", "E": ".", "F": "..-.",
+    "G": "--.", "H": "....", "I": "..", "J": ".---", "K": "-.-", "L": ".-..",
+    "M": "--", "N": "-.", "O": "---", "P": ".--.", "Q": "--.-", "R": ".-.",
+    "S": "...", "T": "-", "U": "..-", "V": "...-", "W": ".--", "X": "-..-",
+    "Y": "-.--", "Z": "--..",
+    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-",
+    "5": ".....", "6": "-....", "7": "--...", "8": "---..", "9": "----.",
+    "/": "-..-.", "?": "..--..", ".": ".-.-.-", ",": "--..--", "-": "-....-",
+    "=": "-...-", ":": "---...", ";": "-.-.-.", "(": "-.--.", ")": "-.--.-",
+}
+
+
+def _samples_to_frames(samples: list) -> list:
+    """Slices a flat list of 16-bit PCM integer samples into 20ms (640-byte) frames."""
+    frames = []
+    for i in range(0, len(samples), SAMPLES_PER_FRAME):
+        chunk = samples[i : i + SAMPLES_PER_FRAME]
+        if len(chunk) < SAMPLES_PER_FRAME:
+            chunk += [0] * (SAMPLES_PER_FRAME - len(chunk))
+        frames.append(_STRUCT_320H.pack(*chunk))
+    return frames
+
+
+def _generate_shaped_tone_samples(
+    freq: float, duration_ms: float, amplitude: int = 12000, sample_rate: int = SAMPLE_RATE
+) -> list:
+    """Generates sine wave samples with 5ms raised-cosine attack and decay to prevent key clicks."""
+    num_samples = int(sample_rate * (duration_ms / 1000.0))
+    if num_samples <= 0:
+        return []
+    edge_samples = min(int(sample_rate * 0.005), num_samples // 2)
+    samples = []
+    for i in range(num_samples):
+        if edge_samples > 0 and i < edge_samples:
+            env = 0.5 * (1.0 - math.cos(math.pi * i / edge_samples))
+        elif edge_samples > 0 and i >= (num_samples - edge_samples):
+            env = 0.5 * (1.0 + math.cos(math.pi * (i - (num_samples - edge_samples)) / edge_samples))
+        else:
+            env = 1.0
+        t = i / sample_rate
+        val = int(amplitude * env * math.sin(2.0 * math.pi * freq * t))
+        samples.append(max(-32768, min(32767, val)))
+    return samples
+
+
+def generate_morse_frames(
+    text: str, wpm: int = 25, freq: float = 800.0, amplitude: int = 14000
+) -> list:
+    """
+    Generates a list of 20ms PCM audio frames (each 640 bytes) containing International Morse Code.
+    Follows standard PARIS timing (Dit = 1200 / wpm ms).
+    Smooth 5ms raised-cosine envelope on key-down and key-up prevents key clicks.
+    """
+    dit_ms = 1200.0 / max(5, wpm)
+    dah_ms = 3.0 * dit_ms
+    intra_element_gap_samples = [0] * int(SAMPLE_RATE * (dit_ms / 1000.0))
+    inter_char_gap_samples = [0] * int(SAMPLE_RATE * ((3.0 * dit_ms) / 1000.0))
+    inter_word_gap_samples = [0] * int(SAMPLE_RATE * ((7.0 * dit_ms) / 1000.0))
+
+    dit_samples = _generate_shaped_tone_samples(freq, dit_ms, amplitude=amplitude)
+    dah_samples = _generate_shaped_tone_samples(freq, dah_ms, amplitude=amplitude)
+
+    all_samples = []
+    # 20ms lead-in silence for clean transmitter keyup
+    all_samples.extend([0] * SAMPLES_PER_FRAME)
+
+    words = text.upper().strip().split()
+    for w_idx, word in enumerate(words):
+        if w_idx > 0:
+            all_samples.extend(inter_word_gap_samples)
+
+        for c_idx, char in enumerate(word):
+            if c_idx > 0:
+                all_samples.extend(inter_char_gap_samples)
+
+            morse_pattern = MORSE_CODE_DICT.get(char, "")
+            for e_idx, element in enumerate(morse_pattern):
+                if e_idx > 0:
+                    all_samples.extend(intra_element_gap_samples)
+
+                if element == ".":
+                    all_samples.extend(dit_samples)
+                elif element == "-":
+                    all_samples.extend(dah_samples)
+
+    # 40ms trailing silence before transmitter unkey
+    all_samples.extend([0] * (SAMPLES_PER_FRAME * 2))
+    return _samples_to_frames(all_samples)
+
+
+# DTMF Dual-Tone Frequencies (ITU-T Q.23 standard)
+DTMF_FREQUENCIES = {
+    "1": (697, 1209), "2": (697, 1336), "3": (697, 1477), "A": (697, 1633),
+    "4": (770, 1209), "5": (770, 1336), "6": (770, 1477), "B": (770, 1633),
+    "7": (852, 1209), "8": (852, 1336), "9": (852, 1477), "C": (852, 1633),
+    "*": (941, 1209), "0": (941, 1336), "#": (941, 1477), "D": (941, 1633),
+}
+
+
+def generate_dtmf_frames(
+    digit: str, duration_ms: int = 100, gap_ms: int = 40, amplitude: int = 12000
+) -> list:
+    """
+    Generates a list of 20ms PCM audio frames containing standard ITU-T DTMF dual tones.
+    Used for Part 97 auxiliary station telecommand and control signaling.
+    """
+    digit_char = str(digit).upper()
+    if digit_char not in DTMF_FREQUENCIES:
+        return []
+
+    f1, f2 = DTMF_FREQUENCIES[digit_char]
+    total_samples = int(SAMPLE_RATE * (duration_ms / 1000.0))
+    edge_samples = min(int(SAMPLE_RATE * 0.005), total_samples // 2)
+
+    samples = []
+    for i in range(total_samples):
+        if edge_samples > 0 and i < edge_samples:
+            env = 0.5 * (1.0 - math.cos(math.pi * i / edge_samples))
+        elif edge_samples > 0 and i >= (total_samples - edge_samples):
+            env = 0.5 * (1.0 + math.cos(math.pi * (i - (total_samples - edge_samples)) / edge_samples))
+        else:
+            env = 1.0
+
+        t = i / SAMPLE_RATE
+        val = int(0.5 * amplitude * env * (math.sin(2.0 * math.pi * f1 * t) + math.sin(2.0 * math.pi * f2 * t)))
+        samples.append(max(-32768, min(32767, val)))
+
+    if gap_ms > 0:
+        samples.extend([0] * int(SAMPLE_RATE * (gap_ms / 1000.0)))
+
+    return _samples_to_frames(samples)
+
+
+def generate_courtesy_tone_frames(style: str = "chime", amplitude: int = 12000) -> list:
+    """
+    Generates authentic Part 97 simplex/repeater courtesy tones and station alert beeps.
+    Supported styles:
+    - 'chime': Dual-tone auxiliary link chime (880 Hz for 50ms, then 1046 Hz for 65ms)
+    - 'single': Classic 1200 Hz 80ms beep
+    - 'quindar': NASA Quindar tone (2475 Hz for 80ms)
+    - 'boop': Low 400 Hz 140ms warning tone (used for Time-Out Timer cutoff and lockout)
+    """
+    style_lower = (style or "chime").lower()
+    if style_lower == "none":
+        return []
+    elif style_lower == "single":
+        return generate_tone_frames(freq=1200.0, duration_ms=80, amplitude=amplitude)
+    elif style_lower == "quindar":
+        return generate_tone_frames(freq=2475.0, duration_ms=80, amplitude=amplitude)
+    elif style_lower == "boop":
+        return generate_tone_frames(freq=400.0, duration_ms=140, amplitude=amplitude)
+    else:  # 'chime' (auxiliary link dual tone)
+        samples = []
+        samples.extend(_generate_shaped_tone_samples(880.0, duration_ms=50, amplitude=amplitude))
+        samples.extend([0] * int(SAMPLE_RATE * 0.015))  # 15ms gap
+        samples.extend(_generate_shaped_tone_samples(1046.5, duration_ms=65, amplitude=amplitude))
+        samples.extend([0] * int(SAMPLE_RATE * 0.020))  # 20ms tail
+        return _samples_to_frames(samples)
+
 
 
 class AudioBackend:

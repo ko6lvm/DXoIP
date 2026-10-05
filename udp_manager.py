@@ -7,6 +7,7 @@ Compatible with standard Python 3 and MicroPython (Raspberry Pi Pico 2 W).
 
 import json
 import socket
+import struct
 import sys
 import threading
 import time
@@ -28,24 +29,28 @@ WATCHDOG_TIMEOUT   = 10.0 # seconds of silence before triggering disconnect
 
 
 def get_local_ips():
-    """Returns local LAN IP addresses of this host."""
+    """Returns local LAN IP addresses of this host, prioritizing the routable default interface."""
     ips = []
-    try:
-        host_name = socket.gethostname()
-        for ip in socket.gethostbyname_ex(host_name)[2]:
-            if not ip.startswith("127."):
-                ips.append(ip)
-    except Exception:
-        pass
+    # 1. Primary routable interface via UDP dummy connect
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
         s.close()
-        if local_ip not in ips and not local_ip.startswith("127."):
+        if not local_ip.startswith("127."):
             ips.append(local_ip)
     except Exception:
         pass
+
+    # 2. Additional host interfaces
+    try:
+        host_name = socket.gethostname()
+        for ip in socket.gethostbyname_ex(host_name)[2]:
+            if not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+
     return ips
 
 
@@ -73,6 +78,13 @@ class UDPManager:
         except (AttributeError, OSError):
             pass
 
+        # Increase UDP socket buffer sizes to absorb bursts and prevent packet drops
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        except (AttributeError, OSError):
+            pass
+
         self.sock.bind(("0.0.0.0", local_port))
         self.local_port = self.sock.getsockname()[1]
         self.stun_host = stun_host
@@ -86,6 +98,8 @@ class UDPManager:
         self.connected = False
         self.running = False
         self.last_rx_time = 0.0
+        self.last_rtt_us = 0
+        self.last_rtt_ms = 0.0
 
         # Background threads
         self._rx_thread = None
@@ -200,9 +214,10 @@ class UDPManager:
         self.running = True
         self.last_rx_time = time.time()
 
-        # Start receiver thread
-        self._rx_thread = threading.Thread(target=self._receive_loop, daemon=True)
-        self._rx_thread.start()
+        # Start receiver thread if not already running
+        if not self._rx_thread or not self._rx_thread.is_alive():
+            self._rx_thread = threading.Thread(target=self._receive_loop, daemon=True)
+            self._rx_thread.start()
 
         # Punch loop
         start_time = time.time()
@@ -225,8 +240,9 @@ class UDPManager:
 
         # Once connected, start watchdog and keepalive thread
         if self.connected:
-            self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
-            self._watchdog_thread.start()
+            if not self._watchdog_thread or not self._watchdog_thread.is_alive():
+                self._watchdog_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+                self._watchdog_thread.start()
 
         return self.connected
 
@@ -256,9 +272,20 @@ class UDPManager:
             except OSError:
                 break
 
+            # Fast-path for locked peer application packets (e.g. RoIP 50 Hz audio frames)
+            if addr == self.peer_addr and data:
+                first_byte = data[0]
+                # Control packets begin with b'P' (0x50), b'A' (0x41), or b'T' (0x54)
+                if first_byte not in (0x50, 0x41, 0x54):
+                    self.last_rx_time = time.time()
+                    if self.on_packet_received:
+                        self.on_packet_received(data)
+                    continue
+
             # Validate sender is one of the candidates or packet is handshake
             is_valid_sender = (
-                any(addr[0] == c[0] for c in self.candidate_addrs)
+                addr == self.peer_addr
+                or any(addr[0] == c[0] for c in self.candidate_addrs)
                 or data.startswith(PREFIX_PUNCH)
                 or data.startswith(PREFIX_ACK)
             )
@@ -295,15 +322,26 @@ class UDPManager:
                         self.on_connected()
 
             # Control: PING
-            elif data == PREFIX_PING:
+            elif data.startswith(PREFIX_PING):
+                # Echo timestamp payload back in PONG for RTT calculation
+                pong_payload = PREFIX_PONG + data[len(PREFIX_PING):]
                 try:
-                    self.sock.sendto(PREFIX_PONG, self.peer_addr)
+                    self.sock.sendto(pong_payload, self.peer_addr)
                 except OSError:
                     pass
 
             # Control: PONG
-            elif data == PREFIX_PONG:
-                pass
+            elif data.startswith(PREFIX_PONG):
+                pong_payload = data[len(PREFIX_PONG):]
+                if len(pong_payload) >= 4:
+                    try:
+                        send_ts = struct.unpack("!I", pong_payload[:4])[0]
+                        now_us = int(time.time() * 1_000_000) & 0xFFFFFFFF
+                        rtt = (now_us - send_ts) & 0xFFFFFFFF
+                        self.last_rtt_us = rtt
+                        self.last_rtt_ms = rtt / 1000.0
+                    except Exception:
+                        pass
 
             # Control: TIMEOUT from peer
             elif data == PREFIX_TIMEOUT:
@@ -316,20 +354,27 @@ class UDPManager:
 
     def _watchdog_loop(self):
         """Periodic keepalive pinger and 10s inactivity watchdog."""
+        last_ping_time = time.time()
         while self.running and self.connected:
-            time.sleep(KEEPALIVE_INTERVAL)
+            time.sleep(0.5)
             if not self.running or not self.connected:
                 break
 
-            # 1. Send keepalive PING to hold NAT pinhole open
-            if self.peer_addr:
-                try:
-                    self.sock.sendto(PREFIX_PING, self.peer_addr)
-                except OSError:
-                    pass
+            now = time.time()
 
-            # 2. Check 10-second inactivity timeout
-            silence_duration = time.time() - self.last_rx_time
+            # 1. Send keepalive PING to hold NAT pinhole open every KEEPALIVE_INTERVAL
+            if now - last_ping_time >= KEEPALIVE_INTERVAL:
+                last_ping_time = now
+                if self.peer_addr:
+                    try:
+                        ts_us = int(now * 1_000_000) & 0xFFFFFFFF
+                        ping_pkt = PREFIX_PING + struct.pack("!I", ts_us)
+                        self.sock.sendto(ping_pkt, self.peer_addr)
+                    except OSError:
+                        pass
+
+            # 2. Check 10-second inactivity timeout promptly
+            silence_duration = now - self.last_rx_time
             if silence_duration > WATCHDOG_TIMEOUT:
                 # Transmit TIMEOUT notification packet to peer before disconnecting
                 try:

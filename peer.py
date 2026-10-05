@@ -90,14 +90,32 @@ def main():
         udp_mgr.stop()
         sys.exit(1)
 
+    def on_packet_received(data):
+        if len(data) >= 8 and data[0] == 0x52:  # 'R' RoIP packet
+            flags = data[1]
+            ptt = bool(flags & 0x01)
+            cos = bool(flags & 0x02)
+            pkt_type = "Heartbeat" if len(data) == 8 else f"AudioData({len(data)}B)"
+            print(f"[RX] {pkt_type} | PTT={ptt} | COS={cos}")
+        else:
+            print(f"[RX] Raw Packet: {len(data)} bytes")
+
+    udp_mgr.on_packet_received = on_packet_received
+
     print("\n[+] SUCCESS! Direct UDP Hole Punched and P2P Session Established!")
     print(f"[+] Active Peer Endpoint: {udp_mgr.peer_addr[0]}:{udp_mgr.peer_addr[1]}")
     print("[*] Connection active. Press Ctrl+C to disconnect.\n")
 
     # 3. Maintain connection until interrupted
     try:
+        last_status_print = time.time()
         while udp_mgr.connected:
             time.sleep(0.5)
+            now = time.time()
+            if now - last_status_print >= 5.0 and udp_mgr.connected:
+                rtt_str = f"{udp_mgr.last_rtt_ms:.1f}ms" if udp_mgr.last_rtt_ms > 0 else "measuring..."
+                print(f"[*] Link active | Peer: {udp_mgr.peer_addr[0]}:{udp_mgr.peer_addr[1]} | Keepalive RTT: {rtt_str}")
+                last_status_print = now
     except (KeyboardInterrupt, EOFError):
         pass
     finally:

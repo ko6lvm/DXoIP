@@ -30,6 +30,11 @@ from tools.audio_simulator.audio_backend import (
     SyntheticAudioBackend,
     calculate_rms_db,
     format_vu_meter,
+    generate_tone_frames,
+    generate_morse_frames,
+    generate_dtmf_frames,
+    generate_courtesy_tone_frames,
+    DTMF_FREQUENCIES,
     BYTES_PER_FRAME,
     SAMPLES_PER_FRAME,
     SAMPLE_RATE,
@@ -381,6 +386,240 @@ class TestSimulatorIntegration(unittest.TestCase):
         finally:
             sim_a.stop()
             sim_b.stop()
+
+    def test_part97_cw_id_transmission(self):
+        """Station sends 25 WPM CW ID; peer receives audio and station sidetone queues."""
+        from tools.audio_simulator.audio_app import RoipAudioSimulator
+
+        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
+        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
+        udp_a.connected = True
+        udp_a.running = True
+        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
+        udp_a._rx_thread.start()
+
+        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
+        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
+        udp_b.connected = True
+        udp_b.running = True
+        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
+        udp_b._rx_thread.start()
+
+        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth", callsign="KO6LVM", cw_wpm=25)
+        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth", callsign="W6ABC", cw_wpm=25)
+
+        sim_a.start()
+        sim_b.start()
+
+        try:
+            # Trigger CW ID
+            self.assertTrue(sim_a.trigger_cw_id(force=True))
+            self.assertTrue(sim_a.is_cw_iding)
+            self.assertTrue(sim_a.is_transmitting)
+            self.assertTrue(sim_a.ptt_line)
+
+            # Wait for transmission frames to stream
+            time.sleep(0.3)
+            self.assertGreater(sim_b.rx_audio_frames, 3)
+            self.assertTrue(sim_b.last_rx_remote_ptt)
+            self.assertTrue(sim_b.is_channel_busy)
+        finally:
+            sim_a.stop()
+            sim_b.stop()
+
+    def test_part97_timeout_timer_enforcement(self):
+        """TOT cut-off: continuous PTT exceeding limit forcibly cuts off TX and locks out."""
+        from tools.audio_simulator.audio_app import RoipAudioSimulator
+
+        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
+        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
+        udp_a.connected = True
+        udp_a.running = True
+        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
+        udp_a._rx_thread.start()
+
+        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
+        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
+        udp_b.connected = True
+        udp_b.running = True
+        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
+        udp_b._rx_thread.start()
+
+        # Set TOT to 0.15 seconds (150ms)
+        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth", tot_limit_s=0.15)
+        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth")
+
+        sim_a.start()
+        sim_b.start()
+
+        try:
+            self.assertTrue(sim_a.key_ptt())
+            self.assertTrue(sim_a.is_transmitting)
+
+            # Wait for TOT cutoff to fire (>150ms)
+            time.sleep(0.25)
+
+            # Transmitter must be forcibly cut off
+            self.assertTrue(sim_a.tot_cutoff)
+            self.assertTrue(sim_a.tot_lockout)
+            self.assertFalse(sim_a.is_transmitting)
+            self.assertFalse(sim_a.ptt_line)
+
+            # Attempting to key PTT while in lockout must fail
+            self.assertFalse(sim_a.key_ptt())
+
+            # Releasing PTT clears lockout
+            sim_a.unkey_ptt()
+            self.assertFalse(sim_a.tot_lockout)
+            self.assertFalse(sim_a.tot_cutoff)
+
+            # Can key again
+            self.assertTrue(sim_a.key_ptt())
+            sim_a.unkey_ptt()
+        finally:
+            sim_a.stop()
+            sim_b.stop()
+
+    def test_part97_dtmf_telecommand(self):
+        """DTMF digit triggers transmission of dual-tone frames and peer receives audio."""
+        from tools.audio_simulator.audio_app import RoipAudioSimulator
+
+        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
+        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
+        udp_a.connected = True
+        udp_a.running = True
+        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
+        udp_a._rx_thread.start()
+
+        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
+        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
+        udp_b.connected = True
+        udp_b.running = True
+        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
+        udp_b._rx_thread.start()
+
+        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth")
+        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth")
+
+        sim_a.start()
+        sim_b.start()
+
+        try:
+            self.assertTrue(sim_a.trigger_dtmf("4"))
+            self.assertEqual(sim_a.current_dtmf_digit, "4")
+            self.assertTrue(sim_a.is_transmitting)
+
+            time.sleep(0.15)
+            self.assertGreater(sim_b.rx_audio_frames, 1)
+            self.assertTrue(sim_b.last_rx_remote_ptt)
+        finally:
+            sim_a.stop()
+            sim_b.stop()
+
+    def test_part97_controller_lines(self):
+        """Verify ptt_line and cos_line reflect hardware states accurately."""
+        from tools.audio_simulator.audio_app import RoipAudioSimulator
+
+        udp_a = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+        udp_b = UDPManager(local_port=0, stun_host="127.0.0.1", stun_port=9999)
+
+        udp_a.peer_addr = ("127.0.0.1", udp_b.local_port)
+        udp_a.candidate_addrs = [("127.0.0.1", udp_b.local_port)]
+        udp_a.connected = True
+        udp_a.running = True
+        udp_a._rx_thread = threading.Thread(target=udp_a._receive_loop, daemon=True)
+        udp_a._rx_thread.start()
+
+        udp_b.peer_addr = ("127.0.0.1", udp_a.local_port)
+        udp_b.candidate_addrs = [("127.0.0.1", udp_a.local_port)]
+        udp_b.connected = True
+        udp_b.running = True
+        udp_b._rx_thread = threading.Thread(target=udp_b._receive_loop, daemon=True)
+        udp_b._rx_thread.start()
+
+        sim_a = RoipAudioSimulator(udp_manager=udp_a, audio_mode="synth")
+        sim_b = RoipAudioSimulator(udp_manager=udp_b, audio_mode="synth")
+
+        sim_a.start()
+        sim_b.start()
+
+        try:
+            # Standby: both lines inactive
+            self.assertFalse(sim_a.ptt_line)
+            self.assertFalse(sim_a.cos_line)
+            self.assertFalse(sim_b.ptt_line)
+            self.assertFalse(sim_b.cos_line)
+
+            # Station A keys PTT
+            sim_a.key_ptt()
+            self.assertTrue(sim_a.ptt_line)
+            self.assertFalse(sim_a.cos_line)  # TX mutes RX COS
+
+            time.sleep(0.15)
+            # Station B should detect carrier (COS line active, PTT line inactive)
+            self.assertTrue(sim_b.cos_line)
+            self.assertFalse(sim_b.ptt_line)
+
+            sim_a.unkey_ptt()
+        finally:
+            sim_a.stop()
+            sim_b.stop()
+
+
+class TestPart97Generators(unittest.TestCase):
+    """Verifies FCC Part 97 CW Morse ID, DTMF telecommand, and courtesy tone synthesis."""
+
+    def test_morse_generation_ko6lvm(self):
+        """KO6LVM at 25 WPM CW Morse generation."""
+        frames = generate_morse_frames("KO6LVM", wpm=25, freq=800.0)
+        self.assertGreater(len(frames), 50)
+        for frame in frames:
+            self.assertEqual(len(frame), BYTES_PER_FRAME)
+            samples = struct.unpack(f"<{SAMPLES_PER_FRAME}h", frame)
+            for s in samples:
+                self.assertGreaterEqual(s, -32768)
+                self.assertLessEqual(s, 32767)
+
+        # Confirm non-silent tone frames exist
+        max_rms = max(calculate_rms_db(f) for f in frames)
+        self.assertGreater(max_rms, -20.0)
+
+    def test_morse_wpm_timing(self):
+        """Higher WPM must produce shorter transmission frame counts."""
+        frames_15wpm = generate_morse_frames("KO6LVM", wpm=15)
+        frames_25wpm = generate_morse_frames("KO6LVM", wpm=25)
+        self.assertGreater(len(frames_15wpm), len(frames_25wpm))
+
+    def test_dtmf_generation_all_digits(self):
+        """All 16 standard ITU-T DTMF digits (0-9, *, #, A-D) generate valid frames."""
+        for digit in DTMF_FREQUENCIES:
+            frames = generate_dtmf_frames(digit, duration_ms=100, gap_ms=40)
+            self.assertGreater(len(frames), 0)
+            for frame in frames:
+                self.assertEqual(len(frame), BYTES_PER_FRAME)
+            max_rms = max(calculate_rms_db(f) for f in frames)
+            self.assertGreater(max_rms, -20.0)
+
+        # Invalid key returns empty list
+        self.assertEqual(generate_dtmf_frames("Z"), [])
+
+    def test_courtesy_tones(self):
+        """Verifies courtesy tone and alert styles."""
+        for style in ["chime", "single", "quindar", "boop"]:
+            frames = generate_courtesy_tone_frames(style)
+            self.assertGreater(len(frames), 0)
+            for f in frames:
+                self.assertEqual(len(f), BYTES_PER_FRAME)
+        self.assertEqual(generate_courtesy_tone_frames("none"), [])
 
 
 if __name__ == "__main__":
