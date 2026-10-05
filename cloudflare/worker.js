@@ -78,11 +78,23 @@ export default {
 
       const roomKey = `room:${room}`;
       const existing = await getRoom(roomKey);
+      const now = Date.now();
 
-      if (!existing) {
-        // Peer 1 joined: store and wait
+      // Check if existing room is stale:
+      // - p1 waiting for more than 45s without p2
+      // - matched room older than 15s
+      const isStale = existing && (
+        (!existing.p2 && (now - existing.p1.ts > 45000)) ||
+        (existing.p2 && (now - (existing.p2.ts || existing.p1.ts) > 15000))
+      );
+
+      // Check if the same peer is restarting/re-joining
+      const isSamePeerAsP1 = existing && (existing.p1.wan === wan && existing.p1.lan === lan);
+
+      if (!existing || isStale || (!existing.p2 && isSamePeerAsP1)) {
+        // Peer 1 joined (or refreshed): store and wait
         const roomData = {
-          p1: { wan, lan, ts: Date.now() },
+          p1: { wan, lan, ts: now },
           p2: null
         };
         await setRoom(roomKey, roomData);
@@ -95,7 +107,7 @@ export default {
 
       } else if (!existing.p2) {
         // Peer 2 joined: store and introduce immediately
-        existing.p2 = { wan, lan, ts: Date.now() };
+        existing.p2 = { wan, lan, ts: now };
         await setRoom(roomKey, existing);
         return new Response(JSON.stringify({
           status: "matched",
@@ -111,6 +123,17 @@ export default {
           headers: corsHeaders
         });
       }
+    }
+
+    // --- /leave or /reset endpoint ---
+    if (url.pathname === "/leave" || url.pathname === "/reset") {
+      const room = url.searchParams.get("room");
+      if (room) {
+        await deleteRoom(`room:${room}`);
+      }
+      return new Response(JSON.stringify({ status: "cleared", room }), {
+        headers: corsHeaders
+      });
     }
 
     // --- /poll endpoint (called by Peer 1 while waiting) ---

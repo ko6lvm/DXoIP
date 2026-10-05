@@ -10,6 +10,7 @@ import struct
 import threading
 import time
 import unittest
+from unittest.mock import MagicMock
 
 from roip_udp import (
     ROIPUDP,
@@ -296,6 +297,101 @@ class TestUdpManagerOptimizations(unittest.TestCase):
 
         self.assertFalse(udp._watchdog_thread.is_alive())
         self.assertLess(elapsed, 1.0)
+
+    def test_join_matchmaker_room_409_recovery(self):
+        """Verify automatic recovery when room returns HTTP 409 Conflict."""
+        import urllib.error
+        from unittest.mock import MagicMock
+
+        udp = UDPManager(local_port=0)
+        udp.public_ip = "1.2.3.4"
+        udp.public_port = 5000
+
+        calls = []
+        def mock_http_request(url, timeout=10.0):
+            calls.append(url)
+            if '/join' in url and len(calls) == 1:
+                fp = MagicMock()
+                fp.read.return_value = b'{"error": "Room already matched or full"}'
+                raise urllib.error.HTTPError(url, 409, "Conflict", {}, fp)
+            elif '/poll' in url:
+                return {"status": "matched", "peer_wan": "9.9.9.9:9999", "peer_lan": "10.0.0.9:9999"}
+            elif '/join' in url:
+                return {"status": "waiting", "room": "test409", "role": "p1"}
+            return {}
+
+        udp._http_request = mock_http_request
+
+        # Should recover by polling and waiting, then timing out or polling peer
+        # Mock poll loop returning peer
+        def mock_poll_after_join(url, timeout=10.0):
+            if '/join' in url and len(calls) == 0:
+                fp = MagicMock()
+                fp.read.return_value = b'{"error": "Room already matched"}'
+                calls.append('join_409')
+                raise urllib.error.HTTPError(url, 409, "Conflict", {}, fp)
+            elif '/poll' in url:
+                calls.append('poll_clean')
+                return {"status": "matched", "peer_wan": "8.8.8.8:8888", "peer_lan": "10.0.0.8:8888"}
+            elif '/join' in url:
+                calls.append('join_ok')
+                return {"status": "matched", "peer_wan": "8.8.8.8:8888", "peer_lan": "10.0.0.8:8888"}
+            return {}
+
+        calls.clear()
+        udp._http_request = mock_poll_after_join
+        wan, lan = udp.join_matchmaker_room("http://fake-server", "test409", poll_timeout=5.0)
+        self.assertEqual(wan, "8.8.8.8:8888")
+        self.assertEqual(lan, "10.0.0.8:8888")
+        self.assertIn('join_409', calls)
+        self.assertIn('poll_clean', calls)
+        self.assertIn('join_ok', calls)
+        udp.stop()
+
+    def test_join_matchmaker_self_match_recovery(self):
+        """Verify self-match is rejected and room is refreshed."""
+        from unittest.mock import MagicMock
+
+        udp = UDPManager(local_port=0)
+        udp.public_ip = "1.2.3.4"
+        udp.public_port = 5000
+        my_wan = f"{udp.public_ip}:{udp.public_port}"
+        wan_ep, lan_ep = udp.get_endpoints()
+        my_lan = f"{lan_ep[0]}:{lan_ep[1]}"
+
+        calls = []
+        def mock_http_request(url, timeout=10.0):
+            if '/join' in url and len(calls) == 0:
+                calls.append('self_match')
+                return {"status": "matched", "peer_wan": my_wan, "peer_lan": my_lan}
+            elif '/poll' in url and len(calls) == 1:
+                calls.append('poll_clear')
+                return {"status": "matched"}
+            elif '/join' in url and len(calls) == 2:
+                calls.append('join_p1')
+                return {"status": "matched", "peer_wan": "9.9.9.9:9999", "peer_lan": "10.0.0.9:9999"}
+            return {}
+
+        udp._http_request = mock_http_request
+        wan, lan = udp.join_matchmaker_room("http://fake-server", "testself", poll_timeout=5.0)
+        self.assertEqual(wan, "9.9.9.9:9999")
+        self.assertEqual(lan, "10.0.0.9:9999")
+        self.assertEqual(calls, ['self_match', 'poll_clear', 'join_p1'])
+        udp.stop()
+
+    def test_last_error_captured(self):
+        """Verify last_error is set on connection failure."""
+        udp = UDPManager(local_port=0)
+        udp.public_ip = "1.2.3.4"
+        udp.public_port = 5000
+        udp.join_matchmaker_room = MagicMock(side_effect=RuntimeError("Custom matchmaker failure"))
+
+        with self.assertRaises(RuntimeError):
+            udp.connect_room("error_room")
+
+        self.assertIsNotNone(udp.last_error)
+        self.assertIn("Custom matchmaker failure", udp.last_error)
+        udp.stop()
 
 
 if __name__ == "__main__":

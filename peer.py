@@ -49,14 +49,14 @@ def main():
     server_url = args.server
     room_key = args.room
 
-    if not server_url and not args.peer:
+    if not room_key and not args.peer:
         print("Choose connection mode:")
         print(" [1] Automated HTTP Room Key (e.g. room 1234)")
         print(" [2] Manual endpoint entry")
         choice = input("Select [1/2] (default 1): ").strip()
         if choice != "2":
-            server_url = input("Enter HTTP Server URL [https://udp-matchmaker.lvmlabs.org]: ").strip() or "https://udp-matchmaker.lvmlabs.org"
-            room_key = input("Enter Room Key (e.g. 1234): ").strip() or "1234"
+            server_url = input(f"Enter HTTP Server URL [{server_url}]: ").strip() or server_url
+            room_key = input("Enter Room Key (default 1234): ").strip() or "1234"
 
     connect_thread = None
     if server_url and room_key:
@@ -86,7 +86,8 @@ def main():
         time.sleep(0.1)
 
     if not udp_mgr.connected:
-        print("[!] Connection failed or timed out.")
+        err_msg = udp_mgr.last_error or "Connection failed or timed out."
+        print(f"[!] {err_msg}")
         udp_mgr.stop()
         sys.exit(1)
 

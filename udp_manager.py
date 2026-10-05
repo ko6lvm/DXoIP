@@ -73,10 +73,11 @@ class UDPManager:
 
     def __init__(self, local_port=0, stun_host="stun.l.google.com", stun_port=19302):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        except (AttributeError, OSError):
-            pass
+        if local_port == 0:
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except (AttributeError, OSError):
+                pass
 
         # Increase UDP socket buffer sizes to absorb bursts and prevent packet drops
         try:
@@ -100,6 +101,7 @@ class UDPManager:
         self.last_rx_time = 0.0
         self.last_rtt_us = 0
         self.last_rtt_ms = 0.0
+        self.last_error = None
 
         # Background threads
         self._rx_thread = None
@@ -129,9 +131,16 @@ class UDPManager:
 
     # --- Matchmaking Signaling ---
 
+    def _http_request(self, url, timeout=10.0):
+        """Performs HTTP GET with User-Agent header and returns parsed JSON."""
+        req = urllib.request.Request(url, headers={"User-Agent": "DXoIP-UDPManager/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     def join_matchmaker_room(self, server_url, room_key, poll_timeout=45.0):
         """
         Contacts the HTTP matchmaker server to register endpoints and retrieve peer endpoints.
+        Includes automatic recovery from stale rooms (HTTP 409) and rejection of self-matches.
         Returns: (peer_wan_str, peer_lan_str)
         """
         wan_ep, lan_ep = self.get_endpoints()
@@ -145,62 +154,125 @@ class UDPManager:
             "lan": my_lan
         })
         join_url = f"{server_url}/join?{params}"
+        poll_url = f"{server_url}/poll?room={urllib.parse.quote(room_key)}"
 
-        req = urllib.request.Request(join_url, headers={"User-Agent": "DXoIP-UDPManager/1.0"})
+        data = None
         try:
-            with urllib.request.urlopen(req, timeout=50.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            data = self._http_request(join_url, timeout=15.0)
         except urllib.error.HTTPError as e:
-            err_msg = e.read().decode("utf-8")
-            raise RuntimeError(f"Server returned HTTP {e.code}: {err_msg}")
+            if e.code == 409:
+                # Room already matched or in dirty state from a prior dead session.
+                # Attempt to consume and reset the stale room by polling it.
+                try:
+                    self._http_request(poll_url, timeout=5.0)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                # Retry /join once
+                try:
+                    data = self._http_request(join_url, timeout=15.0)
+                except urllib.error.HTTPError as retry_e:
+                    if retry_e.code == 409:
+                        raise RuntimeError(
+                            f"Room '{room_key}' is currently occupied by active peers. "
+                            f"Please select a different room key or retry shortly."
+                        )
+                    raise RuntimeError(f"Matchmaker server HTTP {retry_e.code}: {retry_e.read().decode('utf-8', errors='ignore')}")
+            else:
+                err_msg = e.read().decode("utf-8", errors="ignore")
+                raise RuntimeError(f"Matchmaker server HTTP {e.code}: {err_msg}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to reach matchmaker server ({server_url}): {e}")
 
-        # Immediate match (Peer 2 joined)
+        # Check for self-match if server returned immediate match (e.g. re-joining same room)
         if data.get("status") == "matched":
-            return data["peer_wan"], data["peer_lan"]
+            peer_wan = data.get("peer_wan")
+            peer_lan = data.get("peer_lan")
+            if peer_wan == my_wan and peer_lan == my_lan:
+                # Matched with our own previous dead registration!
+                # Consume that match and re-join fresh
+                try:
+                    self._http_request(poll_url, timeout=5.0)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                try:
+                    data = self._http_request(join_url, timeout=15.0)
+                except Exception as e:
+                    raise RuntimeError(f"Error re-registering room '{room_key}' after self-match reset: {e}")
 
-        # Waiting state (Peer 1 joined, poll for Peer 2)
+        # If now matched with a valid distinct peer:
+        if data.get("status") == "matched":
+            peer_wan = data.get("peer_wan")
+            peer_lan = data.get("peer_lan")
+            if peer_wan != my_wan or peer_lan != my_lan:
+                return peer_wan, peer_lan
+
+        # Waiting state (Peer 1 registered, poll for Peer 2)
         if data.get("status") == "waiting":
-            poll_url = f"{server_url}/poll?room={urllib.parse.quote(room_key)}"
             start_time = time.time()
 
             while time.time() - start_time < poll_timeout:
                 time.sleep(1.0)
                 try:
-                    p_req = urllib.request.Request(poll_url, headers={"User-Agent": "DXoIP-UDPManager/1.0"})
-                    with urllib.request.urlopen(p_req, timeout=5.0) as p_resp:
-                        p_data = json.loads(p_resp.read().decode("utf-8"))
-                        if p_data.get("status") == "matched":
-                            return p_data["peer_wan"], p_data["peer_lan"]
-                except urllib.error.HTTPError:
-                    pass
+                    p_data = self._http_request(poll_url, timeout=5.0)
+                    if p_data.get("status") == "matched":
+                        p_wan = p_data.get("peer_wan")
+                        p_lan = p_data.get("peer_lan")
+                        if p_wan == my_wan and p_lan == my_lan:
+                            # Matched with self; continue waiting for actual peer
+                            continue
+                        return p_wan, p_lan
+                except urllib.error.HTTPError as e:
+                    if e.code == 404:
+                        # Room expired on server while waiting; re-register to keep room alive
+                        try:
+                            re_data = self._http_request(join_url, timeout=5.0)
+                            if re_data.get("status") == "matched":
+                                r_wan = re_data.get("peer_wan")
+                                r_lan = re_data.get("peer_lan")
+                                if r_wan != my_wan or r_lan != my_lan:
+                                    return r_wan, r_lan
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
-            raise TimeoutError(f"Timed out waiting for peer in Room '{room_key}' after {poll_timeout}s.")
+            raise TimeoutError(f"Timed out waiting for peer in Room '{room_key}' after {int(poll_timeout)}s.")
 
         raise RuntimeError(f"Unexpected response from server: {data}")
 
     def connect_room(self, room_key, server_url="https://udp-matchmaker.lvmlabs.org"):
         """Resolves peer endpoints via HTTP matchmaker room, then starts hole punching."""
-        peer_wan, peer_lan = self.join_matchmaker_room(server_url, room_key)
-        wan_ip, wan_port = parse_endpoint(peer_wan)
-        lan_ip, lan_port = parse_endpoint(peer_lan) if peer_lan else (None, None)
+        self.last_error = None
+        try:
+            peer_wan, peer_lan = self.join_matchmaker_room(server_url, room_key)
+            wan_ip, wan_port = parse_endpoint(peer_wan)
+            lan_ip, lan_port = parse_endpoint(peer_lan) if peer_lan else (None, None)
 
-        # Hairpinning check: if same WAN IP, prioritize LAN candidate
-        if wan_ip == self.public_ip and lan_ip:
-            return self.punch_candidates(primary=(lan_ip, lan_port), fallback=(wan_ip, wan_port))
-        else:
-            return self.punch_candidates(primary=(wan_ip, wan_port), fallback=(lan_ip, lan_port) if lan_ip else None)
+            # Hairpinning check: if same WAN IP, prioritize LAN candidate
+            if wan_ip == self.public_ip and lan_ip:
+                return self.punch_candidates(primary=(lan_ip, lan_port), fallback=(wan_ip, wan_port))
+            else:
+                return self.punch_candidates(primary=(wan_ip, wan_port), fallback=(lan_ip, lan_port) if lan_ip else None)
+        except Exception as e:
+            self.last_error = str(e)
+            raise e
 
     def connect_peer(self, peer_ip, peer_port, fallback_ip=None, fallback_port=None):
         """Direct connection to a known endpoint without using the HTTP matchmaker."""
-        if not self.public_ip:
-            try:
-                self.discover_public_endpoint()
-            except Exception:
-                pass
-        fallback = (fallback_ip, int(fallback_port)) if fallback_ip and fallback_port else None
-        return self.punch_candidates(primary=(peer_ip, int(peer_port)), fallback=fallback)
+        self.last_error = None
+        try:
+            if not self.public_ip:
+                try:
+                    self.discover_public_endpoint()
+                except Exception:
+                    pass
+            fallback = (fallback_ip, int(fallback_port)) if fallback_ip and fallback_port else None
+            return self.punch_candidates(primary=(peer_ip, int(peer_port)), fallback=fallback)
+        except Exception as e:
+            self.last_error = str(e)
+            raise e
 
     # --- Hole Punching Engine ---
 

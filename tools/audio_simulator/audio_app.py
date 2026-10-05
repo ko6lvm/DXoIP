@@ -739,7 +739,8 @@ def main():
         time.sleep(0.1)
 
     if not udp_mgr.connected:
-        print("[!] Connection failed or timed out.")
+        err_msg = udp_mgr.last_error or "Connection failed or timed out."
+        print(f"[!] {err_msg}")
         udp_mgr.stop()
         sys.exit(1)
 
